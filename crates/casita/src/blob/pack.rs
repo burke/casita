@@ -4296,8 +4296,8 @@ impl PackedChunks {
                         lazy.apply(&decoded);
                         apply_decoded_index_delta(&mut candidate, decoded);
                     }
-                    if let Some(base) = published_map {
-                        lazy.base = Some(base);
+                    if let (Some(current), Some(base)) = (&mut lazy.base, published_map) {
+                        *current = base;
                     }
                     *current = candidate;
                     *self.lazy_catalog.write().unwrap() = lazy;
@@ -5529,13 +5529,41 @@ impl PackedChunks {
         refs: &mut BTreeMap<u8, CatalogRunRef>,
         lazy: &LazyCatalogOverlay,
     ) -> io::Result<(CatalogBase, Option<ShardedIndexBase>)> {
-        let CatalogBase::Sharded { shard_bits, .. } = base else {
+        let CatalogBase::Sharded { root, shard_bits } = base else {
             return Ok((base.clone(), None));
         };
-        let current = lazy
-            .base
-            .as_ref()
-            .ok_or_else(|| io::Error::other("sharded catalog has no loaded map"))?;
+        let loaded;
+        let current = if let Some(current) = lazy.base.as_ref() {
+            current
+        } else {
+            self.read_counters
+                .index_requests
+                .fetch_add(1, Ordering::Relaxed);
+            let bytes = self
+                .object_store
+                .get(&sharded_path(&self.base, INDEXES_KIND, root))
+                .await
+                .map_err(io::Error::other)?
+                .bytes()
+                .await
+                .map_err(io::Error::other)?;
+            self.read_counters
+                .index_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            let started = Instant::now();
+            let actual = Digest::from(blake3::hash(&bytes));
+            self.read_counters.index_hash_nanos.fetch_add(
+                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            if actual != *root {
+                return Err(io::Error::other("catalog shard-map identity mismatch"));
+            }
+            loaded = ShardedIndexBase {
+                map: Arc::new(decode_shard_map(&bytes)?),
+            };
+            &loaded
+        };
         if current.map.shard_bits != *shard_bits {
             return Err(io::Error::other("sharded catalog map width changed"));
         }
@@ -8618,6 +8646,121 @@ mod tests {
         reader.reset_read_stats();
         assert_eq!(reader.metadata(&wanted.digest).await.unwrap(), Some(4096));
         assert_eq!(reader.read_stats().index_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn standalone_carries_preserve_a_materialized_sharded_checkpoint() {
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let base = Path::from("standalone-materialized-sharded-carries");
+        let writer = PackedChunks::open(objects.clone(), base.clone(), u64::MAX)
+            .await
+            .unwrap();
+        let (first, first_bytes) = chunk(b"first materialized shard");
+        writer
+            .put(first.clone(), first_bytes.clone())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        // A sharded checkpoint can still have a complete in-process index in
+        // standalone mode. Keep this fixture small by publishing its shards
+        // directly instead of filling the 4 MiB checkpoint threshold.
+        let publish_map = |index: &Index| {
+            let encoded = encode_index_shards(index, 2).unwrap();
+            let map = decode_shard_map(&encoded.map).unwrap();
+            (encoded, map)
+        };
+        let (initial, _) = publish_map(&writer.index.read().unwrap());
+        for (digest, bytes) in initial.objects {
+            put_object(
+                &objects,
+                &sharded_path(&base, INDEXES_KIND, &digest),
+                bytes,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        put_object(
+            &objects,
+            &sharded_path(&base, INDEXES_KIND, &initial.map_digest),
+            initial.map,
+            true,
+        )
+        .await
+        .unwrap();
+        let empty_delta = delta::encode_index_delta(&Index::default(), &Index::default()).unwrap();
+        let prepare_carry = |witness: &mut IndexCatalogWitness, root, generation| {
+            witness.generation = generation;
+            witness.root = Some(DeltaCatalog {
+                sidecars: None,
+                generation,
+                base: CatalogBase::Sharded {
+                    root,
+                    shard_bits: 2,
+                },
+                runs: BTreeMap::new(),
+                deltas: vec![empty_delta.clone(); 1024],
+            });
+            witness.runs.clear();
+        };
+        {
+            let mut witness = writer.index_catalog.lock().unwrap();
+            prepare_carry(&mut witness, initial.map_digest, 1025);
+        }
+        assert!(writer.lazy_catalog.read().unwrap().base.is_none());
+        writer.register_manifest(BlobId::new(blake3::hash(b"first carry").into()));
+        writer.flush().await.unwrap();
+        assert!(writer.lazy_catalog.read().unwrap().base.is_none());
+
+        let (added, added_bytes) = chunk(b"shard added between carries");
+        writer
+            .put(added.clone(), added_bytes.clone())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let (checkpoint, map) = publish_map(&writer.index.read().unwrap());
+        assert_ne!(checkpoint.map_digest, initial.map_digest);
+        assert!(!map.chunks.is_empty());
+        for (digest, bytes) in checkpoint.objects {
+            put_object(
+                &objects,
+                &sharded_path(&base, INDEXES_KIND, &digest),
+                bytes,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        put_object(
+            &objects,
+            &sharded_path(&base, INDEXES_KIND, &checkpoint.map_digest),
+            checkpoint.map,
+            true,
+        )
+        .await
+        .unwrap();
+        {
+            let mut witness = writer.index_catalog.lock().unwrap();
+            prepare_carry(&mut witness, checkpoint.map_digest, 2051);
+        }
+        writer.register_manifest(BlobId::new(blake3::hash(b"second carry").into()));
+        writer.flush().await.unwrap();
+        assert!(writer.lazy_catalog.read().unwrap().base.is_none());
+
+        let reopened = PackedChunks::open(objects, base, u64::MAX).await.unwrap();
+        // A standalone `get` may recover from inventory, so inspect the
+        // published catalog before asking it to read payload bytes.
+        assert!(reopened.location(&first.digest).await.unwrap().is_some());
+        assert!(reopened.location(&added.digest).await.unwrap().is_some());
+        assert_eq!(
+            reopened.get(&first.digest).await.unwrap(),
+            Some(first_bytes)
+        );
+        assert_eq!(
+            reopened.get(&added.digest).await.unwrap(),
+            Some(added_bytes)
+        );
     }
 
     #[tokio::test]
