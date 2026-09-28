@@ -444,7 +444,7 @@ where
                         "Git tree name is not UTF-8 on this platform".into(),
                     )
                 })?;
-                crate::filesystem::checkout::check_windows_name(name).map_err(|reason| {
+                crate::filesystem::names::check_windows_name(name).map_err(|reason| {
                     RepositoryError::InvalidInput(format!(
                         "cannot materialize Git name `{name}`: {reason}"
                     ))

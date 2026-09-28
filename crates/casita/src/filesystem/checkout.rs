@@ -353,12 +353,6 @@ async fn create_symlink(root: &FsRoot, target: &SymlinkTarget, path: &Path) -> R
 }
 
 #[cfg(windows)]
-const WINDOWS_RESERVED_NAMES: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-];
-
-#[cfg(windows)]
 fn check_windows_directory_names(
     directory: &crate::Directory,
     directory_path: &Path,
@@ -369,7 +363,7 @@ fn check_windows_directory_names(
             format!("stored name {name} is not valid UTF-8, which Windows cannot materialize")
                 .into()
         })?;
-        check_windows_name(name).map_err(|reason| -> Error {
+        names::check_windows_name(name).map_err(|reason| -> Error {
             format!(
                 "cannot materialize `{name}` under {}: {reason}",
                 directory_path.display()
@@ -383,40 +377,6 @@ fn check_windows_directory_names(
             )
             .into());
         }
-    }
-    Ok(())
-}
-
-/// Validate one name against Windows path and device-name rules.
-#[cfg(windows)]
-pub(crate) fn check_windows_name(name: &str) -> Result<(), String> {
-    for character in name.chars() {
-        match character {
-            '\\' => return Err("`\\` is a path separator on Windows".into()),
-            ':' => return Err("`:` opens a drive or NTFS stream".into()),
-            '<' | '>' | '"' | '|' | '?' | '*' => {
-                return Err(format!(
-                    "`{character}` is not allowed in Windows file names"
-                ));
-            }
-            '\0'..='\x1f' => {
-                return Err(format!(
-                    "control character {:#04x} is not allowed in Windows file names",
-                    character as u32
-                ));
-            }
-            _ => {}
-        }
-    }
-    if name.ends_with('.') || name.ends_with(' ') {
-        return Err("Windows strips a trailing dot or space".into());
-    }
-    let base = name.split('.').next().unwrap_or(name);
-    if WINDOWS_RESERVED_NAMES
-        .iter()
-        .any(|reserved| base.eq_ignore_ascii_case(reserved))
-    {
-        return Err(format!("`{base}` is a reserved device name on Windows"));
     }
     Ok(())
 }

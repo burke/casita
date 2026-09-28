@@ -46,6 +46,46 @@ pub(crate) fn os_str_from_bytes(b: &[u8]) -> Result<&OsStr, Error> {
     })
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Validate one name against Windows path and device-name rules.
+#[cfg(any(windows, test))]
+pub(crate) fn check_windows_name(name: &str) -> Result<(), String> {
+    for character in name.chars() {
+        match character {
+            '\\' => return Err("`\\` is a path separator on Windows".into()),
+            ':' => return Err("`:` opens a drive or NTFS stream".into()),
+            '<' | '>' | '"' | '|' | '?' | '*' => {
+                return Err(format!(
+                    "`{character}` is not allowed in Windows file names"
+                ));
+            }
+            '\0'..='\x1f' => {
+                return Err(format!(
+                    "control character {:#04x} is not allowed in Windows file names",
+                    character as u32
+                ));
+            }
+            _ => {}
+        }
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Err("Windows strips a trailing dot or space".into());
+    }
+    let base = name.split('.').next().unwrap_or(name);
+    if WINDOWS_RESERVED_NAMES
+        .iter()
+        .any(|reserved| base.eq_ignore_ascii_case(reserved))
+    {
+        return Err(format!("`{base}` is a reserved device name on Windows"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,5 +113,25 @@ mod tests {
     #[test]
     fn non_utf8_bytes_are_refused() {
         assert!(os_str_from_bytes(b"caf\xff").is_err());
+    }
+
+    #[test]
+    fn windows_name_rules() {
+        for name in ["file.txt", "ünîcøde", "com10.txt"] {
+            assert!(check_windows_name(name).is_ok(), "{name}");
+        }
+        for name in [
+            "CON",
+            "con.txt",
+            "Lpt9.log",
+            "file.",
+            "file ",
+            "dir\\file",
+            "file:stream",
+            "file?",
+            "file\x01",
+        ] {
+            assert!(check_windows_name(name).is_err(), "{name}");
+        }
     }
 }
