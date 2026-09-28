@@ -1,62 +1,82 @@
 # fskit-native
 
-An unpublished crate for reusable native Rust FSKit integration. It implements
-the FSKit filesystem, volume, and item callbacks in Rust, together with
-security-scoped path resource ownership and retryable backend shutdown.
+Rust filesystem contracts and native callbacks for macOS FSKit extensions.
+The crate has no dependency on Casita. Its backend contract uses only standard
+library types, while the macOS adapter uses `objc2`, `objc2-foundation`,
+`objc2-fs-kit`, and `block2`.
 
-It has no dependency on Casita. On macOS it uses `objc2`, `objc2-foundation`,
-`objc2-fs-kit`, and `block2`. The portable contract uses the standard library.
-Consumers implement `Filesystem` and optionally `Control`; `BackendSession`
-coordinates concurrent operations and shutdown.
-Names and symlink targets are bytes, reads use caller-provided buffers, and
-directory snapshots retain optional attributes across paginated enumeration.
+## Backend contract
 
-The extension executable calls `native::register` from its constructor, supplying
-an `Extension` with a display name, filesystem type, accepted resource kinds, and
-a backend factory. Its Info.plist must use `FSKitNativeFileSystem` as
-`EXExtensionPrincipalClass`. The executable links Apple's extension entry point.
-Both path resources and block-device-backed fixtures are supported. File reads
-can borrow immutable data or return owned bytes without an extra temporary copy.
+Implement `Filesystem` to provide metadata, lookup, directory snapshots, reads,
+symlinks, and shutdown. Implement `Control` if the backend also handles
+application-specific operations. `BackendSession` admits concurrent callbacks
+and coordinates retryable shutdown. The consumer remains responsible for OS
+unmounting.
 
-The current adapter supports immutable files, directories, symlinks, an empty
-xattr namespace (or FSKit emulation), and optional backend-defined creation
-callbacks. It is not a general writable filesystem implementation. Creation can
-serve application control operations, but ordinary writes and other mutations
-return `EROFS`. Volume statistics currently use fixed synthetic values.
+Names and symlink targets are byte sequences. Reads fill caller-provided
+buffers, or can return borrowed or owned initialized bytes to the native
+adapter. Directory snapshots retain optional attributes across paginated
+enumeration. See the [contract design and limits](https://github.com/cachix/casita/blob/main/crates/fskit-native/CONTRACT.md)
+for the full backend requirements.
 
-The optional `setup` feature provides rootless registration and activation:
-`setup::register(app, "Example.appex", "org.example.filesystem")`. It verifies
-the signature and module identity, serializes settings changes across modules,
-and upgrades bundle paths only when no FSKit volumes are mounted. Registration
-changes force an agent restart even for an already enabled module; interrupted
-activation can be retried. Use a new app path for upgrades. Automatic activation
-requires access to macOS's protected FSKit settings. If macOS denies that access,
-setup completes registration and any required agent restart successfully.
-Inaccessible settings do not mean that approval is missing. Attempt the mount;
-macOS checks approval, and the caller should provide enablement instructions if
-it fails. Other settings errors still stop setup before registration changes.
+## Native extension
 
-Normal mounts should call `setup::installed("Example.appex", "org.example.filesystem")`
-to discover and verify the selected bundle without changing registration
-or restarting the agent. Keep the returned `Installation` alive until unmounting.
-Its shared lock permits independent mounts while preventing explicit setup from
-replacing their installation. `app()` identifies the installed bundle and
-`property()` reads signed extension metadata for application protocol checks.
-Pending activation returns an error requiring explicit setup.
-Discovery does not read macOS's protected activation settings. macOS checks user
-approval when mounting; enable the extension in System Settings under General →
-Login Items & Extensions → By Category → File System Extensions.
+The extension executable calls `native::register` from its constructor with
+an `Extension` that specifies a display name, filesystem type, accepted
+resource kinds, and backend factory. Set `EXExtensionPrincipalClass` to
+`FSKitNativeFileSystem` in its Info.plist and link Apple's extension entry
+point. The adapter supports path resources and block-device-backed fixtures.
+No Swift or separate IPC bridge is required.
 
-The consumer owns its app identity, signing, packaging, and OS mount/unmount
-orchestration. No Swift or additional IPC bridge is required.
+The adapter serves immutable files, directories, and symlinks. It provides an
+empty xattr namespace or uses FSKit emulation, and it can delegate creation to
+the backend for application control operations. Ordinary writes and other
+mutations return `EROFS`. Volume statistics use fixed synthetic values.
 
-The native adapter derives from the objc2 FSKit example. Its MIT attribution is
-preserved in `LICENSE-MIT.txt`.
+The consumer owns its app identity, signing, packaging, and mount lifecycle.
 
-Casita's memory fixture and repository implementation exercise the same contract:
+## Registration and mounting
+
+The optional `setup` feature provides rootless registration and activation on
+macOS:
+
+```rust,ignore
+setup::register(app, "Example.appex", "org.example.filesystem")?;
+```
+
+Registration verifies the signature and module identity, serializes settings
+changes across modules, and replaces an installed bundle only when no FSKit
+volumes are mounted. A registration change restarts the agent, even when the
+module was already enabled. An interrupted activation can be retried. Use a
+new app path for upgrades.
+
+For a normal mount, call `setup::installed` to find and verify the selected
+bundle without changing registration or restarting the agent. Keep the
+returned `Installation` alive until unmounting. Its shared lock allows other
+mounts while preventing setup from replacing their installation. `app()`
+identifies the installed bundle, and `property()` reads signed extension
+metadata. Pending activation requires an explicit setup call.
+
+Automatic activation requires access to macOS's protected FSKit settings. If
+macOS denies that access, setup can still complete registration and any
+required agent restart. Attempt the mount to let macOS check user approval;
+if it fails, direct the user to **System Settings → General → Login Items &
+Extensions → By Category → File System Extensions**. Other settings errors
+stop setup before registration changes.
+
+## Development and license
+
+From the Casita repository root, run the crate tests with:
+
+```sh
+cargo test -p fskit-native --all-features
+```
+
+Casita's memory fixture and repository backend also exercise the contract:
 
 ```sh
 cargo test --locked --manifest-path crates/casita-fskit/Cargo.toml --features repository --lib
 ```
 
-See [contract design and limits](CONTRACT.md).
+The native adapter derives from the objc2 FSKit example. Its MIT attribution
+is preserved in `LICENSE-MIT.txt`.

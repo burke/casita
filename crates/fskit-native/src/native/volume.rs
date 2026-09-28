@@ -286,7 +286,7 @@ define_class!(
                 Ok(None) => reply.call((null_mut(), null_mut(), posix_err(ENOENT))),
                 Err(error) => {
                     eprintln!("lookup: {error:#}");
-                    reply.call((null_mut(), null_mut(), posix_err(EIO)));
+                    reply.call((null_mut(), null_mut(), io_err(&error)));
                 }
             }
         }

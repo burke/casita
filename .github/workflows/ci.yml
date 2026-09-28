@@ -12,6 +12,15 @@ permissions:
   contents: read
 
 jobs:
+  fskit-native-msrv:
+    name: fskit-native (Rust 1.94.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - run: cargo test -p fskit-native --all-features
+      - run: cargo package -p fskit-native
+
   docs:
     name: docs
     runs-on: ubuntu-latest
@@ -89,6 +98,7 @@ jobs:
           cargo clippy -p fskit-native --all-features --all-targets -- -D warnings
           cargo check -p casita-fs --no-default-features
           RUSTDOCFLAGS="-D warnings" cargo doc -p casita-fs -p fskit-native --all-features --no-deps
+          cargo package -p fskit-native
       - name: Native FSKit extension
         if: runner.os == 'macOS'
         shell: devenv shell bash -- -euo pipefail {0}

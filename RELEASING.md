@@ -15,10 +15,13 @@ The initial supported distribution is:
 - prebuilt CLI archives for the tested release targets; and
 - `SHA256SUMS` covering every attached artifact.
 
-Crates.io publication is not part of the initial contract. Optional WAL3 and
-Chroma dependencies remain pinned to Git revisions and cannot currently be
-represented by a publishable crates.io package. Do not treat `cargo publish` or
-`cargo package` as a release gate until that policy changes explicitly.
+Crates.io publication of the `casita` and `casita-fs` packages is not part of
+the initial contract. Optional WAL3 and Chroma dependencies remain pinned to
+Git revisions and cannot currently be represented by a publishable crates.io
+package. Do not treat `cargo publish` or `cargo package` for those packages as
+a release gate until that policy changes explicitly. The independent
+`fskit-native` crate can be published separately; its package verification
+does not establish that Casita's source or binary release is ready.
 
 The initial binary feature profile is `cli,git,ssh`. `cli` enables the
 `experimental` API internally; release binaries exclude the optional S3,
@@ -45,6 +48,18 @@ The initial binary targets are the targets exercised by release CI:
 Adding a target requires a CI runner that executes the supported feature
 profile and validates the produced archive. Removing a target requires release
 notes and a support-matrix update.
+
+## Independent `fskit-native` crate
+
+`fskit-native` has no Casita dependency and can be released to crates.io on its
+own version line. Its release does not use the `v<version>` tags reserved for
+Casita. Before publishing, confirm the crate version and README. Check that the
+Rust 1.94.1, Linux, and macOS CI jobs pass for the exact candidate commit, and
+inspect the package contents with `cargo package -p fskit-native --list`. Run
+`cargo package -p fskit-native` and `cargo publish -p fskit-native --dry-run`
+from a clean checkout. Publish only the verified candidate, then record it with
+an annotated `fskit-native-v<version>` tag and release notes. Do not move a
+published tag or reuse a published crate version.
 
 ## Compatibility and lockfile policy
 
