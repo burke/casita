@@ -95,6 +95,13 @@ and will use [Semantic Versioning](https://semver.org/) for tagged releases.
 
 ### Changed
 
+- On macOS, repositories whose state is a `TursoMetadataStore`, including
+  `Repository::local` and custom compositions, flush the drive cache
+  (`F_FULLFSYNC`) before deleting payloads whenever the database changed since
+  the last flush. Commits sync only to the drive's volatile cache there, so a
+  power loss could previously keep a collection's deletions while losing the
+  commit that allowed them, leaving roots that referenced deleted payloads.
+  Commits themselves cost nothing more; a collection pass pays one flush.
 - Publishing a packed catalog to an object store that lacks conditional
   updates now fails with `NotSupported` instead of silently overwriting the
   catalog pointer, which let concurrent writers lose each other's updates.

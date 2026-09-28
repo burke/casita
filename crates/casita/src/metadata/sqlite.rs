@@ -82,6 +82,8 @@ pub struct TursoMetadataStore {
     db: Arc<TursoDb>,
     validated: ValidationCounter,
     pins: Arc<std::sync::OnceLock<Arc<super::FilePinStore>>>,
+    /// Shared by clones so their deletions coalesce on one flush.
+    commits: Option<crate::blob::CommitDurability>,
 }
 
 impl TursoMetadataStore {
@@ -131,6 +133,7 @@ impl TursoMetadataStore {
             .map_err(from_database_error)?;
         }
         Ok(Self {
+            commits: crate::blob::CommitDurability::for_database(db.path()),
             db,
             validated: ValidationCounter::default(),
             pins: Default::default(),
@@ -829,6 +832,9 @@ impl MetadataStore for TursoMetadataStore {
         Some(Arc::new(TursoVerificationFacts {
             db: self.db.clone(),
         }))
+    }
+    fn commit_durability(&self) -> Option<crate::blob::CommitDurability> {
+        self.commits.clone()
     }
     async fn commit_checked(
         &self,

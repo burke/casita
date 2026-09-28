@@ -104,6 +104,8 @@ SMOKE = {
     "gix-odb": ["--profile", "smoke"],
     "process-contention": [],
     "state-publication": ["--iterations", "10"],
+    "metadata-durability": ["--iterations", "10"],
+    "deletion-ordering": ["--iterations", "1"],
     "catalog-maintenance": ["--iterations", "100"],
     "catalog-durability": ["--iterations", "10"],
     "logical-state": ["--entries", "4096"],
@@ -141,7 +143,7 @@ def build_commands(selected, build_dir):
             names.add(suite.replace("-", "_"))
         elif suite in SUITE_BUILD_SPECS:
             names.add(SUITE_BUILD_SPECS[suite].artifact_name)
-        elif suite in {"state-publication", "catalog-maintenance", "catalog-durability", "logical-state", "s3-catalog-index"}:
+        elif suite in {"state-publication", "metadata-durability", "deletion-ordering", "catalog-maintenance", "catalog-durability", "logical-state", "s3-catalog-index"}:
             names.add("casita-lib-test")
         elif suite in {"casitar", "casitar-scaling", "casitar-import-profile", "casitar-pin-profile", "casitar-quiet-import", "fault-and-recovery", "generations", "process-contention"}:
             names.add("casita")
@@ -205,7 +207,7 @@ def suite_arguments(identifier, binary_dir, profile, repetitions):
         arguments += ["--include-small-buffer-control"]
     if identifier == "fsck":
         arguments += ["--seed-probe", str(binary_dir / "casita-lib-test")]
-    if identifier in {"state-publication", "catalog-maintenance", "catalog-durability", "logical-state", "s3-catalog-index"}:
+    if identifier in {"state-publication", "metadata-durability", "deletion-ordering", "catalog-maintenance", "catalog-durability", "logical-state", "s3-catalog-index"}:
         arguments += ["--probe-binary", str(binary_dir / "casita-lib-test")]
     elif identifier in {"casitar", "casitar-scaling", "casitar-import-profile", "casitar-pin-profile", "casitar-quiet-import", "fault-and-recovery", "generations", "process-contention"}:
         arguments += ["--casita-bin", str(binary_dir / "casita")]

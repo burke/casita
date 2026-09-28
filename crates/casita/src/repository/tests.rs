@@ -5020,6 +5020,48 @@ async fn composed_repository_takes_on_the_local_profile() {
     );
 }
 
+/// Pairing a payload store with a metadata store whose commits can be
+/// volatile is enough: neither `Repository::local` nor a profile is involved.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collection_deletes_only_after_the_commits_that_allow_it_are_durable() {
+    let temporary = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temporary.path().join("blobs")).unwrap();
+    let repository = Repository::new(
+        crate::ChunkedBlobStore::local_packed(temporary.path().join("blobs"))
+            .await
+            .unwrap(),
+        crate::TursoMetadataStore::open(temporary.path().join("casita.sqlite"))
+            .await
+            .unwrap(),
+    );
+    let commits = repository.metadata().commit_durability().unwrap();
+    let name: RootName = "collected".parse().unwrap();
+    let session = repository.mutation_session().await.unwrap();
+    let object = session.stage_blob(&vec![7; 1 << 20]).await.unwrap();
+    let key = object.record().key().clone();
+    session
+        .publish_rooted(vec![object], name.clone(), key)
+        .await
+        .unwrap();
+    drop(session);
+    repository
+        .mutation_session()
+        .await
+        .unwrap()
+        .publish(Vec::new(), vec![RootChange::Remove { name }])
+        .await
+        .unwrap();
+
+    let before = commits.flushes();
+    let outcome = repository.collect().await.unwrap();
+    assert!(outcome.removed.payload_blobs > 0, "{outcome:?}");
+    assert!(
+        commits.flushes() > before,
+        "collection deleted payloads without first flushing the commit that allowed it"
+    );
+}
+
 #[tokio::test]
 async fn reopen_and_fsck_recover_after_publication_commit_failure() {
     let temporary = tempfile::tempdir().unwrap();

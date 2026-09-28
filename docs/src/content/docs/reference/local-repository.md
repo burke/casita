@@ -115,6 +115,16 @@ development-only schemas from before the first release must be recreated or
 re-imported. A future schema change will require an explicit offline migration
 rather than modifying a repository during ordinary open.
 
+Every commit syncs the WAL before it is acknowledged (`synchronous = FULL`).
+On Linux and Windows that sync reaches stable storage. On macOS it reaches the
+drive's volatile cache, so a power loss may discard the most recent
+acknowledged commits. Deletions that a commit allows (collection sweeps and
+catalog reclamation) first flush the drive cache (`F_FULLFSYNC`) whenever the
+database changed since the last flush, so a power loss cannot keep those
+deletions while losing the commit behind them: the repository reopens
+consistent, at an earlier revision. That costs one flush per collection pass
+rather than one per commit.
+
 ## Physical payload behavior
 
 Payload identity is always BLAKE3 over complete plaintext bytes. The default

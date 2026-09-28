@@ -386,6 +386,11 @@ impl BlobStore for RepairingBlobStore {
         }
     }
 
+    // Repairs and collection delete only near-tier representations.
+    fn order_deletions_after(&self, commits: super::CommitDurability) {
+        self.near.order_deletions_after(commits);
+    }
+
     async fn chunks(&self, digest: &BlobId) -> Result<Option<Vec<ChunkMeta>>, Error> {
         let _guard = self.gate.read().await;
         match self.near.chunks(digest).await {

@@ -176,6 +176,98 @@ async fn benchmark_state_publication() {
     println!("state_writers {writers}");
 }
 
+/// What a drive-cache flush per commit would cost: Turso commit latency with
+/// the production sync (`fsync`) and with `PRAGMA fullfsync` (`full`,
+/// `F_FULLFSYNC` on Apple platforms, the only ones where the modes differ),
+/// from empty commits to batches that amortize the flush. Casita flushes once
+/// before deletions instead (`blob::deletion_barrier`). A reopened inventory
+/// audit gates each mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "performance probe; run through benchmark run metadata-durability"]
+async fn benchmark_metadata_commit_durability() {
+    use crate::digest::{BlobId, Digest};
+    use crate::format::{FormatLimits, FormatRegistry};
+    use futures::TryStreamExt;
+    use std::collections::BTreeSet;
+    use std::io::Cursor;
+
+    let iterations: usize = std::env::var("CASITA_METADATA_DURABILITY_BENCH_ITERATIONS")
+        .ok()
+        .map(|v| v.parse().unwrap())
+        .unwrap_or(20);
+    let sizes: Vec<usize> = std::env::var("CASITA_METADATA_DURABILITY_BENCH_OBJECTS")
+        .unwrap_or_else(|_| "0,1,1024,16384".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    assert!(iterations > 0 && !sizes.is_empty());
+    for (mode, drive_cache_flush) in [("fsync", false), ("full", true)] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let store = TursoMetadataStore::open(&path).await.unwrap();
+        let setting = if drive_cache_flush { "ON" } else { "OFF" };
+        let reported = store
+            .database()
+            .write(move |connection| {
+                Box::pin(async move {
+                    connection
+                        .execute_batch(&format!("PRAGMA fullfsync = {setting};"))
+                        .await?;
+                    let mut rows = connection.query("PRAGMA fullfsync", ()).await?;
+                    Ok(rows
+                        .next()
+                        .await?
+                        .ok_or("no fullfsync row")?
+                        .get::<i64>(0)?)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(reported, i64::from(drive_cache_flush));
+        let mut revision = store.snapshot().await.unwrap().revision();
+        let mut expected = BTreeSet::new();
+        let mut next_object = 0_u64;
+        for &size in &sizes {
+            let mut nanos = 0_u128;
+            for _ in 0..iterations {
+                let mut mutation = MetadataMutation::new();
+                for _ in 0..size {
+                    let bytes = next_object.to_le_bytes();
+                    next_object += 1;
+                    let key = ObjectKey::blob(BlobId::new(Digest::hash(&bytes)));
+                    let object = FormatRegistry::builtin()
+                        .verify(&key, &mut Cursor::new(bytes), &FormatLimits::default())
+                        .await
+                        .unwrap();
+                    expected.insert(key);
+                    mutation.add_object(object);
+                }
+                let started = Instant::now();
+                let committed = store.commit(&revision, mutation).await.unwrap();
+                nanos += started.elapsed().as_nanos();
+                assert_eq!(committed.objects_inserted, size);
+                revision = committed.revision;
+            }
+            println!(
+                "metadata_durability_{mode}_objects_{size}_commit_nanos {}",
+                nanos / iterations as u128
+            );
+        }
+        drop(store);
+        let reopened = TursoMetadataStore::open(&path).await.unwrap();
+        let snapshot = reopened.snapshot().await.unwrap();
+        assert_eq!(snapshot.revision(), revision);
+        let actual = snapshot
+            .objects_unordered()
+            .map_ok(|object| object.key().clone())
+            .try_collect::<BTreeSet<_>>()
+            .await
+            .unwrap();
+        assert_eq!(actual, expected, "{mode}: reopened inventory");
+    }
+    println!("metadata_durability_iterations {iterations}");
+}
+
 /// Snapshot acquisition/drop and commits while an older revision is retained.
 /// The deep-copy variant reproduces the old snapshot algorithm in this binary.
 #[tokio::test]

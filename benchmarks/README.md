@@ -403,6 +403,16 @@ Additional coverage is available through:
   limit, with process RSS, spill metrics, and exact checkout audits.
 - `state-publication`: immutable snapshots and concurrent exact-revision CAS,
   including losing writers and independent commit retries on memory and Turso.
+- `deletion-ordering`: collection passes deleting 1, 64, and 1024 unrooted
+  payloads, and an idle pass after each, on a local repository. Each deleting
+  pass must flush committed state the same number of times regardless of how
+  much it deletes, an idle pass must not flush, and the reopened repository
+  must pass `fsck`.
+- `metadata-durability`: Turso commit latency from empty commits to 16384-object
+  batches, with the production `fsync` against the drive-cache flush of
+  `PRAGMA fullfsync`, which is what flushing every commit would cost on Apple
+  platforms (the modes differ nowhere else). A reopened inventory audit gates
+  each mode.
 - `process-contention`: independent CLI writers beside root-list snapshot readers and fsck scans;
   every writer's root and restored bytes must survive.
 - `casitar`: export, import, duplicate-payload import, tar import and malformed rejection.
