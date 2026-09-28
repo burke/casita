@@ -27,6 +27,8 @@ pub(crate) trait DirectorySource: Send + Sync {
 /// Unicode normalization, and native name encoding) a strict admission check:
 /// Casita either writes the exact names or leaves `target` free of partial
 /// content. On success the sibling is renamed into place.
+/// On Windows filesystems that cannot replace an existing empty directory,
+/// publication briefly removes that directory before renaming the sibling.
 ///
 /// Every directory, file, and link is created relative to one open handle on
 /// the staging root, so nothing this writes can land outside it even if a
@@ -43,18 +45,14 @@ where
     BS: BlobStore,
     DS: DirectorySource,
 {
-    if directories.get(root).await?.is_none() {
-        return Err(Error::NotFound {
-            digest: (*root).into(),
-        });
-    }
+    let root_directory = directories.get(root).await?.ok_or(Error::NotFound {
+        digest: (*root).into(),
+    })?;
     let target = target.as_ref();
-    let mut stage = CheckoutStage::create(target).await?;
-    let result = checkout_staged(payloads, directories, root, stage.path()).await;
-    match result {
-        Ok(()) => stage.publish().await,
-        Err(error) => Err(error),
-    }
+    let stage = CheckoutStage::create(target).await?;
+    checkout_staged(payloads, directories, root, root_directory, stage.path()).await?;
+    stage.publish().await??;
+    Ok(())
 }
 
 /// Materialize one verified directory graph below an already-created staging
@@ -63,6 +61,7 @@ async fn checkout_staged<BS, DS>(
     payloads: &BS,
     directories: &DS,
     root: &DirectoryId,
+    root_directory: crate::Directory,
     staging: &Path,
 ) -> Result<(), Error>
 where
@@ -70,16 +69,78 @@ where
     DS: DirectorySource,
 {
     let target = FsRoot::open_write(staging).await?;
+    let entries = prepare_directories(directories, root, root_directory, &target).await?;
 
-    let mut files = Vec::<(BlobId, bool, PathBuf)>::new();
-    let mut symlinks = Vec::<(SymlinkTarget, PathBuf)>::new();
+    tracing::debug!(
+        directories = entries.directory_count,
+        files = entries.files.len(),
+        symlinks = entries.symlinks.len(),
+        "filesystem checkout entries prepared"
+    );
+    let target = &target;
+    stream::iter(entries.files)
+        .map(|file| async move {
+            write_file(payloads, target, &file.digest, file.executable, &file.path)
+                .await
+                .map_err(|error| checkout_path_error(&file.path, error))
+        })
+        .buffer_unordered(16)
+        .try_collect::<Vec<()>>()
+        .await?;
+
+    // Symlinks come last, after anything they may point at exists.
+    for link in entries.symlinks {
+        create_symlink(target, &link.target, &link.path)
+            .await
+            .map_err(|error| checkout_path_error(&link.path, error))?;
+    }
+    tracing::info!(
+        directories = entries.directory_count,
+        "filesystem checkout materialized"
+    );
+    Ok(())
+}
+
+struct FileEntry {
+    digest: BlobId,
+    executable: bool,
+    path: PathBuf,
+}
+
+struct SymlinkEntry {
+    target: SymlinkTarget,
+    path: PathBuf,
+}
+
+struct PreparedEntries {
+    files: Vec<FileEntry>,
+    symlinks: Vec<SymlinkEntry>,
+    directory_count: usize,
+}
+
+/// Create parent directories before writing their files and links. The returned
+/// entries wait until every parent directory exists.
+async fn prepare_directories<DS: DirectorySource>(
+    directories: &DS,
+    root: &DirectoryId,
+    root_directory: crate::Directory,
+    target: &FsRoot,
+) -> Result<PreparedEntries, Error> {
+    let mut entries = PreparedEntries {
+        files: Vec::new(),
+        symlinks: Vec::new(),
+        directory_count: 0,
+    };
     let mut pending = vec![(*root, PathBuf::new())];
-    let mut directory_count = 0usize;
+    let mut root_directory = Some(root_directory);
     while let Some((digest, directory_path)) = pending.pop() {
-        directory_count += 1;
-        let directory = directories.get(&digest).await?.ok_or(Error::NotFound {
-            digest: digest.into(),
-        })?;
+        entries.directory_count += 1;
+        let directory = match root_directory.take() {
+            Some(directory) => directory,
+            None => directories.get(&digest).await?.ok_or(Error::NotFound {
+                digest: digest.into(),
+            })?,
+        };
         #[cfg(windows)]
         check_windows_directory_names(&directory, &directory_path)?;
 
@@ -95,40 +156,19 @@ where
                 }
                 Node::File {
                     digest, executable, ..
-                } => files.push((*digest, *executable, child)),
-                Node::Symlink { target } => symlinks.push((target.clone(), child)),
+                } => entries.files.push(FileEntry {
+                    digest: *digest,
+                    executable: *executable,
+                    path: child,
+                }),
+                Node::Symlink { target } => entries.symlinks.push(SymlinkEntry {
+                    target: target.clone(),
+                    path: child,
+                }),
             }
         }
     }
-
-    tracing::debug!(
-        directories = directory_count,
-        files = files.len(),
-        symlinks = symlinks.len(),
-        "filesystem checkout planned"
-    );
-    let target = &target;
-    stream::iter(files)
-        .map(|(digest, executable, path)| async move {
-            write_file(payloads, target, &digest, executable, &path)
-                .await
-                .map_err(|error| checkout_path_error(&path, error))
-        })
-        .buffer_unordered(16)
-        .try_collect::<Vec<()>>()
-        .await?;
-
-    // Symlinks come last, after anything they may point at exists.
-    for (link_target, path) in symlinks {
-        create_symlink(target, &link_target, &path)
-            .await
-            .map_err(|error| checkout_path_error(&path, error))?;
-    }
-    tracing::info!(
-        directories = directory_count,
-        "filesystem checkout materialized"
-    );
-    Ok(())
+    Ok(entries)
 }
 
 /// A newly-created staging directory contains no caller files. Consequently an
@@ -154,9 +194,8 @@ fn checkout_path_error(path: &Path, error: Error) -> Error {
 /// rename operation a single complete tree to publish. The target itself may
 /// already exist, but must remain an empty real directory.
 struct CheckoutStage {
-    temporary: PathBuf,
+    temporary: Option<PathBuf>,
     destination: PathBuf,
-    published: bool,
 }
 
 static NEXT_CHECKOUT_STAGE: AtomicU64 = AtomicU64::new(0);
@@ -202,9 +241,8 @@ impl CheckoutStage {
             match tokio::fs::create_dir(&temporary).await {
                 Ok(()) => {
                     return Ok(Self {
-                        temporary,
+                        temporary: Some(temporary),
                         destination: destination.to_path_buf(),
-                        published: false,
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -219,29 +257,58 @@ impl CheckoutStage {
     }
 
     fn path(&self) -> &Path {
-        &self.temporary
+        self.temporary
+            .as_deref()
+            .expect("staging path exists until publication")
     }
 
+    /// The blocking task owns cleanup as well as the rename. Dropping its
+    /// join handle cannot remove the stage while publication is still running.
     #[tracing::instrument(name = "filesystem.checkout.publish", level = "debug", skip_all)]
-    async fn publish(&mut self) -> Result<(), Error> {
-        let temporary = self.temporary.clone();
-        let destination = self.destination.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), Error> {
-            match std::fs::rename(&temporary, &destination) {
-                Ok(()) => Ok(()),
-                Err(error) => Err(error.into()),
-            }
+    fn publish(mut self) -> tokio::task::JoinHandle<Result<(), Error>> {
+        tokio::task::spawn_blocking(move || {
+            let result = std::fs::rename(self.path(), &self.destination).map_err(Error::from);
+            #[cfg(windows)]
+            let result = result.or_else(|error| {
+                publish_over_empty_directory(self.path(), &self.destination, error)
+            });
+            result?;
+            drop(self.temporary.take());
+            Ok(())
         })
-        .await??;
-        self.published = true;
-        Ok(())
     }
+}
+
+/// Some Windows filesystems cannot rename a directory over an existing empty
+/// directory. Remove that empty destination and restore it if the second rename
+/// fails. A concurrent observer may briefly see the destination absent.
+#[cfg(windows)]
+fn publish_over_empty_directory(
+    temporary: &Path,
+    destination: &Path,
+    rename_error: Error,
+) -> Result<(), Error> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        _ => return Err(rename_error),
+    }
+    if std::fs::read_dir(destination)?.next().is_some() {
+        return Err(Error::TargetNotEmpty {
+            path: destination.to_path_buf(),
+        });
+    }
+    std::fs::remove_dir(destination)?;
+    if let Err(error) = std::fs::rename(temporary, destination) {
+        let _ = std::fs::create_dir(destination);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 impl Drop for CheckoutStage {
     fn drop(&mut self) {
-        if !self.published {
-            let _ = std::fs::remove_dir_all(&self.temporary);
+        if let Some(temporary) = &self.temporary {
+            let _ = std::fs::remove_dir_all(temporary);
         }
     }
 }
@@ -522,6 +589,157 @@ mod tests {
             1,
             "failed checkout leaked a sibling staging directory"
         );
+    }
+
+    #[tokio::test]
+    async fn checkout_replaces_an_existing_empty_target() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("checkout");
+        std::fs::create_dir(&destination).unwrap();
+        let root = Directory::new();
+        let root_id = root.digest();
+        let directories = Directories {
+            entries: BTreeMap::from([(root_id, root)]),
+        };
+
+        checkout(
+            &MemoryBlobStore::new(),
+            &directories,
+            &root_id,
+            &destination,
+        )
+        .await
+        .unwrap();
+
+        assert!(destination.is_dir());
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn publication_preserves_a_destination_filled_after_staging() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("checkout");
+        std::fs::create_dir(&destination).unwrap();
+        let stage = CheckoutStage::create(&destination).await.unwrap();
+        std::fs::write(stage.path().join("new"), b"staged").unwrap();
+        std::fs::write(destination.join("existing"), b"caller data").unwrap();
+
+        assert!(stage.publish().await.unwrap().is_err());
+
+        assert_eq!(
+            std::fs::read(destination.join("existing")).unwrap(),
+            b"caller data"
+        );
+        assert!(!destination.join("new").exists());
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_does_not_follow_a_destination_link_added_after_staging() {
+        let temporary = tempfile::tempdir().unwrap();
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("existing"), b"caller data").unwrap();
+        let destination = temporary.path().join("checkout");
+        let stage = CheckoutStage::create(&destination).await.unwrap();
+        std::fs::write(stage.path().join("new"), b"staged").unwrap();
+        std::os::unix::fs::symlink(&outside, &destination).unwrap();
+
+        assert!(stage.publish().await.unwrap().is_err());
+
+        assert!(
+            std::fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(outside.join("existing")).unwrap(),
+            b"caller data"
+        );
+        assert!(!outside.join("new").exists());
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_fallback_replaces_an_existing_empty_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let staging = temporary.path().join("staging");
+        let destination = temporary.path().join("checkout");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("file"), b"payload").unwrap();
+        std::fs::create_dir(&destination).unwrap();
+
+        publish_over_empty_directory(
+            &staging,
+            &destination,
+            io::Error::from(io::ErrorKind::AlreadyExists).into(),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(destination.join("file")).unwrap(), b"payload");
+        assert!(!staging.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_fallback_restores_the_empty_directory_after_rename_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("checkout");
+        std::fs::create_dir(&destination).unwrap();
+
+        assert!(
+            publish_over_empty_directory(
+                &temporary.path().join("missing-stage"),
+                &destination,
+                io::Error::from(io::ErrorKind::AlreadyExists).into(),
+            )
+            .is_err()
+        );
+
+        assert!(destination.is_dir());
+        assert!(std::fs::read_dir(&destination).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn dropping_a_queued_publication_keeps_its_staging_directory() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let temporary = tempfile::tempdir().unwrap();
+            let destination = temporary.path().join("checkout");
+            let stage = CheckoutStage::create(&destination).await.unwrap();
+            std::fs::write(stage.path().join("file"), b"payload").unwrap();
+
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.await.unwrap();
+
+            let publication = stage.publish();
+            drop(publication);
+            assert!(!destination.exists());
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !destination.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(destination.join("file")).unwrap(), b"payload");
+            assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
+        });
     }
 
     #[test]
