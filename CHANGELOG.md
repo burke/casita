@@ -98,6 +98,9 @@ and will use [Semantic Versioning](https://semver.org/) for tagged releases.
 - Publishing a packed catalog to an object store that lacks conditional
   updates now fails with `NotSupported` instead of silently overwriting the
   catalog pointer, which let concurrent writers lose each other's updates.
+- SSH transfers pass `ConnectTimeout=30`, `ServerAliveInterval=15`, and
+  `ServerAliveCountMax=3` to OpenSSH, so an unreachable or silent host fails
+  the sync instead of blocking it indefinitely.
 - Transfer has two entry points, `transfer` and `transfer_path`, each taking
   `TransferOptions`. `transfer_session`, `transfer_session_with_discovery`,
   `transfer_path_session` and `transfer_path_session_with_discovery` were

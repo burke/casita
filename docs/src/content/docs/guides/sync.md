@@ -65,6 +65,12 @@ OpenSSH handles authentication, host-key checks, and proxy settings. Casita
 still verifies the received objects locally. `--writer NAME` sets the
 diagnostic WAL writer name when an S3 endpoint is involved.
 
+Casita passes `ConnectTimeout=30`, `ServerAliveInterval=15`, and
+`ServerAliveCountMax=3` to `ssh`, so an unreachable host fails within 30
+seconds, and a host or network that stops answering mid-transfer fails the
+sync within about 45 seconds instead of blocking it. These command-line
+options take precedence over the same settings in `ssh_config`.
+
 ## Read payloads from another repository
 
 Use `--from-blobs` when roots and object records live at one endpoint but the
