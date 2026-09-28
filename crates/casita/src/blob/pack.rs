@@ -4413,8 +4413,10 @@ impl PackedChunks {
                 extensions: Default::default(),
             }
         } else {
-            match self
-                .object_store
+            // The pointer is the shared catalog's compare-and-swap. A store
+            // that cannot condition the write would let concurrent publishers
+            // overwrite each other, so refuse rather than degrade to `put`.
+            self.object_store
                 .put_opts(
                     &catalog_path,
                     catalog.clone().into(),
@@ -4424,24 +4426,19 @@ impl PackedChunks {
                     },
                 )
                 .await
-            {
-                Ok(result) => result,
-                Err(
+                .map_err(|error| match error {
                     object_store::Error::NotImplemented { .. }
-                    | object_store::Error::NotSupported { .. },
-                ) => {
-                    self.read_counters
-                        .index_put_requests
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.read_counters
-                        .index_put_bytes
-                        .fetch_add(catalog.len() as u64, Ordering::Relaxed);
-                    self.object_store
-                        .put(&catalog_path, catalog.clone().into())
-                        .await?
-                }
-                Err(error) => return Err(error),
-            }
+                    | object_store::Error::NotSupported { .. } => {
+                        object_store::Error::NotSupported {
+                            source: Box::new(io::Error::other(format!(
+                                "pack catalog publication requires conditional writes \
+                                 from the object store (for a local directory, use \
+                                 ChunkedBlobStore::local_packed): {error}"
+                            ))),
+                        }
+                    }
+                    error => error,
+                })?
         };
         next.version = Some(result.into());
         next.pointer_digest = Some(blake3::hash(&catalog).into());
@@ -11743,6 +11740,46 @@ mod tests {
         for (meta, _) in &chunks[3..] {
             assert!(reopened.get(&meta.digest).await.unwrap().is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn catalog_pointer_refuses_stores_without_conditional_updates() {
+        // LocalFileSystem supports create-only puts but not `PutMode::Update`.
+        // Without the local catalog lock, publication must fail rather than
+        // overwrite a pointer another writer may have advanced.
+        let directory = tempfile::tempdir().unwrap();
+        let objects: Arc<dyn ObjectStore> = Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(directory.path()).unwrap(),
+        );
+        let base = Path::from("repository");
+        let store = ChunkedBlobStore::packed_with_options(
+            objects.clone(),
+            base.clone(),
+            DEFAULT_AVG_CHUNK_SIZE,
+            crate::PackOptions {
+                target_size: u64::MAX,
+                cache_capacity: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let pointer = base.clone().join(INDEX_POINTER_NAME);
+        let read_pointer = || async { objects.get(&pointer).await.unwrap().bytes().await.unwrap() };
+        let opened = read_pointer().await;
+        let error = store.put_slice(b"small file").await.unwrap_err();
+        let unsupported = matches!(
+            &error,
+            crate::error::Error::Io(io) if matches!(
+                io.get_ref().and_then(|inner| inner.downcast_ref::<object_store::Error>()),
+                Some(object_store::Error::NotSupported { .. })
+            )
+        );
+        assert!(unsupported, "{error}");
+        assert_eq!(
+            read_pointer().await,
+            opened,
+            "the pointer must not be overwritten"
+        );
     }
 
     #[tokio::test]

@@ -95,6 +95,9 @@ and will use [Semantic Versioning](https://semver.org/) for tagged releases.
 
 ### Changed
 
+- Publishing a packed catalog to an object store that lacks conditional
+  updates now fails with `NotSupported` instead of silently overwriting the
+  catalog pointer, which let concurrent writers lose each other's updates.
 - Transfer has two entry points, `transfer` and `transfer_path`, each taking
   `TransferOptions`. `transfer_session`, `transfer_session_with_discovery`,
   `transfer_path_session` and `transfer_path_session_with_discovery` were

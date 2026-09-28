@@ -103,12 +103,22 @@ async fn run_case(case: &str, capacity: usize, cycles: usize, budget: usize) -> 
             .collect()
     };
     let directory = tempfile::tempdir().unwrap();
-    let objects =
-        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(directory.path()).unwrap());
-    let packed =
-        PackedChunks::open_with_cache(objects, Path::default(), 4 * 1024 * 1024, 8 * 1024 * 1024)
-            .await
+    // A LocalFileSystem cannot condition catalog updates, so a local packed
+    // store publishes through the same catalog lock production uses.
+    let filesystem =
+        object_store::local::LocalFileSystem::new_with_prefix(directory.path()).unwrap();
+    let durability =
+        crate::blob::local_durability::LocalDurability::new(filesystem.clone(), directory.path())
             .unwrap();
+    let packed = PackedChunks::open_with_cache_and_durability(
+        Arc::new(filesystem),
+        Path::default(),
+        4 * 1024 * 1024,
+        8 * 1024 * 1024,
+        Some(durability),
+    )
+    .await
+    .unwrap();
     let mut chunks = Vec::new();
     for &(at, len) in &pieces {
         let bytes = &data[at..at + len];
