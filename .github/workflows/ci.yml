@@ -15,6 +15,7 @@ jobs:
   fskit-native-msrv:
     name: fskit-native (Rust 1.94.1)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.94.1
@@ -24,6 +25,7 @@ jobs:
   docs:
     name: docs
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: cachix/install-nix-action@v31
@@ -61,6 +63,9 @@ jobs:
             runs-on: [self-hosted, macOS, ARM64]
     name: test (${{ matrix.system }})
     runs-on: ${{ matrix.runs-on }}
+    # Bounds a hung test (for example a transport without liveness) to the
+    # suite's normal runtime plus margin instead of the six-hour default.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v5
       - uses: cachix/install-nix-action@v31
@@ -147,6 +152,14 @@ jobs:
             --output "$RUNNER_TEMP/casita-archive-smoke.json"
           benchmark run fault-and-recovery --casita-bin target/debug/casita --repetitions 1 \
             --output "$RUNNER_TEMP/casita-recovery-smoke.json"
+      - name: Keep benchmark smoke outputs
+        if: failure() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-smoke-${{ github.run_id }}
+          path: ${{ runner.temp }}/casita-*-smoke.*
+          if-no-files-found: ignore
+          retention-days: 14
 
   # windows can't run Nix, so it uses the native rustup toolchain pinned to the
   # same 1.96.0. Windows is a supported platform for the whole feature set:
@@ -156,6 +169,7 @@ jobs:
   # core the wasm worker consumes.
   windows:
     runs-on: windows-latest
+    timeout-minutes: 150
     env:
       # Turso contains paths too long for Cargo's default user-profile cache.
       CARGO_HOME: C:\c
@@ -197,6 +211,7 @@ jobs:
   # contributor without the local git-hook still lands formatted code.
   fmt:
     runs-on: [self-hosted, linux, X64]
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:

@@ -21,6 +21,8 @@ jobs:
   fuzz:
     name: fuzz (${{ github.event_name == 'schedule' && 'scheduled' || 'smoke' }})
     runs-on: ubuntu-latest
+    # Scheduled runs spend 600 s on each of five targets, plus the build.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
@@ -74,6 +76,7 @@ jobs:
     continue-on-error: true
     name: fuzz coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
@@ -113,10 +116,19 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     name: miri (owned parsers)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - run: cargo miri test --no-default-features --test hostile_inputs
+      # The suite is gated on `experimental`; without it the file compiles to
+      # zero tests and the job passes without checking anything.
+      - name: Run the hostile-input suite under Miri
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo miri test --no-default-features --features experimental \
+            --test hostile_inputs 2>&1 | tee "$RUNNER_TEMP/miri.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/miri.log"
