@@ -5607,6 +5607,24 @@ impl PackedChunks {
                 source: "cannot checkpoint a partially materialized sharded catalog".into(),
             });
         }
+        // A publication without index mutations, such as one that only updates
+        // sidecars, would otherwise fall through to the checkpoint branch below
+        // and rebuild the base from `candidate`. After a lazy open of a sharded
+        // base, `candidate` holds only the entries this process materialized,
+        // so that checkpoint would silently drop every other chunk, pack and
+        // manifest. Publish an empty delta over the unchanged base instead.
+        let empty_delta;
+        let delta = match delta {
+            None if !force && lazy.base.is_some() && witness.root.is_some() => {
+                empty_delta = encode_index_mutations(candidate, &IndexMutations::default())
+                    .map_err(|error| object_store::Error::Generic {
+                        store: "pack index catalog",
+                        source: Box::new(error),
+                    })?;
+                Some(&empty_delta[..])
+            }
+            delta => delta,
+        };
         let generation =
             witness
                 .generation
@@ -5824,6 +5842,13 @@ impl PackedChunks {
                 prepared_map,
             )
         } else {
+            // `candidate` is the complete index only without a lazy base.
+            if lazy.base.is_some() {
+                return Err(object_store::Error::Generic {
+                    store: "pack index catalog",
+                    source: "cannot checkpoint a partially materialized sharded catalog".into(),
+                });
+            }
             let checkpoint = encode_index_checkpoint(
                 candidate,
                 Digest::from(blake3::hash(b"casita authoritative pack index v1\0")),
@@ -8123,6 +8148,87 @@ mod tests {
         reader.finish_deletions(true).await.unwrap();
         assert_eq!(reader.prepare_state_catalog().await.unwrap(), None);
         assert_eq!(reader.get(&meta.digest).await.unwrap(), Some(compressed));
+    }
+
+    #[tokio::test]
+    async fn sidecar_only_publication_keeps_a_lazy_sharded_base() {
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let base = Path::from("lazy-sharded-sidecar-only");
+        let writer = PackedChunks::open(objects.clone(), base.clone(), u64::MAX)
+            .await
+            .unwrap();
+        let (meta, compressed) = chunk(b"payload known only to the sharded base");
+        writer.put(meta.clone(), compressed.clone()).await.unwrap();
+        writer.flush().await.unwrap();
+        let index = writer.index.read().unwrap().clone();
+        let encoded = encode_index_shards(&index, 4).unwrap();
+        for (digest, bytes) in &encoded.objects {
+            put_object(
+                &objects,
+                &sharded_path(&base, INDEXES_KIND, digest),
+                bytes.clone(),
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        put_object(
+            &objects,
+            &sharded_path(&base, INDEXES_KIND, &encoded.map_digest),
+            encoded.map,
+            true,
+        )
+        .await
+        .unwrap();
+        let catalog = encode_delta_catalog(&DeltaCatalog {
+            sidecars: None,
+            generation: 7,
+            base: CatalogBase::Sharded {
+                root: encoded.map_digest,
+                shard_bits: 4,
+            },
+            runs: BTreeMap::new(),
+            deltas: Vec::new(),
+        })
+        .unwrap();
+        let reader = PackedChunks::open_with_state_catalog(
+            objects.clone(),
+            base.clone(),
+            u64::MAX,
+            0,
+            &catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.index.read().unwrap().chunks.len(), 0);
+
+        // Only a sidecar changes, so this publication carries no index delta.
+        let blob = BlobId::new(blake3::hash(b"sidecar-only publication").into());
+        reader
+            .put_sidecar(blob, Bytes::from_static(b"outboard"))
+            .await
+            .unwrap();
+        let next = reader
+            .prepare_state_catalog()
+            .await
+            .unwrap()
+            .expect("a dirty sidecar publishes a catalog");
+        reader.finish_state_catalog(true).unwrap();
+        let root = decode_delta_catalog(&next).unwrap();
+        assert!(
+            matches!(root.base, CatalogBase::Sharded { root, .. } if root == encoded.map_digest),
+            "the lazily opened base must not be replaced by a checkpoint of the materialized index"
+        );
+
+        let reopened =
+            PackedChunks::open_with_state_catalog(objects, base, u64::MAX, 0, &next)
+                .await
+                .unwrap();
+        assert_eq!(reopened.get(&meta.digest).await.unwrap(), Some(compressed));
+        assert_eq!(
+            reopened.sidecar(blob, None).await.unwrap(),
+            Some(Bytes::from_static(b"outboard"))
+        );
     }
 
     #[tokio::test]
