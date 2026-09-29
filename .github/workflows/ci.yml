@@ -48,9 +48,9 @@ jobs:
           working-directory: docs
           site: https://casita.rs
 
-  # Linux and macOS run on the same self-hosted builders as devenv's own PR
-  # pipeline. Both run through devenv (Nix): the clippy git-hook, then the
-  # all-features, default-feature, and portable test suites. macOS is unix, so
+  # Linux and macOS run on GitHub-hosted builders through devenv (Nix):
+  # the clippy git-hook, then the all-features, default-feature, and portable
+  # test suites. macOS is unix, so
   # the native store code compiles and its tests run there too.
   test:
     strategy:
@@ -58,9 +58,9 @@ jobs:
       matrix:
         include:
           - system: x86_64-linux
-            runs-on: [self-hosted, linux, X64]
+            runs-on: ubuntu-latest
           - system: aarch64-darwin
-            runs-on: [self-hosted, macOS, ARM64]
+            runs-on: macos-15
     name: test (${{ matrix.system }})
     runs-on: ${{ matrix.runs-on }}
     # Bounds a hung test (for example a transport without liveness) to the
@@ -210,7 +210,7 @@ jobs:
   # reformat with the pinned toolchain and commit any changes back, so a
   # contributor without the local git-hook still lands formatted code.
   fmt:
-    runs-on: [self-hosted, linux, X64]
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: write
