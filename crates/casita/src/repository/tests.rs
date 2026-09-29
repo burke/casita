@@ -5053,13 +5053,37 @@ async fn collection_deletes_only_after_the_commits_that_allow_it_are_durable() {
         .await
         .unwrap();
 
+    // A pass can prune logically and defer its physical deletions to a later
+    // pass (for example, when catalog pins changed meanwhile). The flush is
+    // owed to deletions, so check each pass that deleted a file.
+    fn files(directory: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+        let mut found = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                found.extend(files(&path));
+            } else {
+                found.insert(path);
+            }
+        }
+        found
+    }
+    let payloads = temporary.path().join("blobs");
+    let stored = files(&payloads);
     let before = commits.flushes();
-    let outcome = repository.collect().await.unwrap();
-    assert!(outcome.removed.payload_blobs > 0, "{outcome:?}");
-    assert!(
-        commits.flushes() > before,
-        "collection deleted payloads without first flushing the commit that allowed it"
-    );
+    let mut removed = 0;
+    for _ in 0..16 {
+        removed += repository.collect().await.unwrap().removed.payload_blobs;
+        if !stored.is_subset(&files(&payloads)) {
+            assert!(
+                commits.flushes() > before,
+                "collection deleted payloads without first flushing the commit that allowed it"
+            );
+            assert!(removed > 0);
+            return;
+        }
+    }
+    panic!("collection never deleted the removed root's payloads");
 }
 
 #[tokio::test]
