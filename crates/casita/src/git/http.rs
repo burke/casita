@@ -1,24 +1,36 @@
-//! Minimal read-only smart-HTTP adapter for one bound native Git view.
+//! Read-only smart HTTP for one bound native Git view.
 //!
-//! The adapter deliberately implements only the two stateless upload-pack
-//! endpoints. It closes each HTTP/1.1 connection after one response, which is
-//! standards-compliant and keeps request parsing small and bounded.
+//! Hyper owns HTTP/1 framing. Casita owns Git semantics, bounded content
+//! decoding, request concurrency, and pack generation.
 
+use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
+use hyper::body::{Frame, Incoming};
+use hyper::header::{self, HeaderMap};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::time::{Sleep, timeout};
 
 use crate::{BlobStore, GitFetchError, GitFetchService, MetadataStore};
 
 const MAX_HTTP_HEADERS: usize = 64 * 1024;
 const STREAM_BUFFER_BYTES: usize = 1024 * 1024;
+type HttpBody = UnsyncBoxBody<Bytes, std::io::Error>;
 
 /// Production resource and deadline controls for the smart-HTTP listener.
 #[derive(Clone)]
@@ -40,7 +52,7 @@ pub struct GitHttpOptions {
     pub idle_timeout: Duration,
     /// Total lifetime of one accepted HTTP request.
     pub total_request_timeout: Duration,
-    /// Maximum time allowed for one response socket write.
+    /// Maximum time without progress while writing a response.
     pub response_write_timeout: Duration,
     /// Total time allowed for pack generation, including output backpressure.
     pub pack_generation_timeout: Duration,
@@ -199,10 +211,6 @@ where
 }
 
 /// Serve smart HTTP with explicit production limits and graceful shutdown.
-///
-/// Once `shutdown` resolves, the listener stops accepting connections and
-/// waits up to [`GitHttpOptions::graceful_shutdown_timeout`] for accepted
-/// requests to finish.
 #[tracing::instrument(name = "git.http.serve_with_shutdown", skip_all)]
 pub async fn serve_git_smart_http_with_shutdown<PS, SS, F>(
     listener: TcpListener,
@@ -255,16 +263,8 @@ where
                     let started = Instant::now();
                     let result = timeout(
                         options.total_request_timeout,
-                        handle_connection(
-                            stream,
-                            &route,
-                            &service,
-                            &options,
-                            pack_generations,
-                            request_bytes,
-                        ),
-                    )
-                    .await;
+                        handle_connection(stream, route, service, options.clone(), pack_generations, request_bytes),
+                    ).await;
                     let outcome = match result {
                         Ok(Ok(served)) => GitHttpOutcome::Served {
                             method: served.method,
@@ -277,18 +277,13 @@ where
                         Ok(Err(_)) => GitHttpOutcome::RequestFailure,
                     };
                     if let Some(observer) = &options.observer {
-                        observer.observe(&GitHttpEvent {
-                            peer,
-                            outcome,
-                            elapsed: started.elapsed(),
-                        });
+                        observer.observe(&GitHttpEvent { peer, outcome, elapsed: started.elapsed() });
                     }
                     drop(connection_permit);
                 });
             }
         }
     }
-
     let drain = async { while tasks.join_next().await.is_some() {} };
     if timeout(options.graceful_shutdown_timeout, drain)
         .await
@@ -334,14 +329,9 @@ impl GitHttpOptions {
             ("max_connections", self.max_connections),
             ("max_pack_generations", self.max_pack_generations),
         ] {
-            if value == 0 {
+            if value == 0 || value > Semaphore::MAX_PERMITS {
                 return Err(GitHttpError::InvalidOptions(format!(
-                    "{name} must be greater than zero"
-                )));
-            }
-            if value > Semaphore::MAX_PERMITS {
-                return Err(GitHttpError::InvalidOptions(format!(
-                    "{name} exceeds Tokio's semaphore limit"
+                    "{name} must fit Tokio's semaphore limit and be nonzero"
                 )));
             }
         }
@@ -350,17 +340,13 @@ impl GitHttpOptions {
                 "response_buffer_bytes must be greater than zero".into(),
             ));
         }
-        if self.max_inflight_request_bytes < max_request_bytes {
-            return Err(GitHttpError::InvalidOptions(format!(
-                "max_inflight_request_bytes ({}) must cover max_request_bytes ({max_request_bytes})",
-                self.max_inflight_request_bytes
-            )));
-        }
-        if self.max_inflight_request_bytes > u32::MAX as usize
+        if self.max_inflight_request_bytes < max_request_bytes
+            || self.max_inflight_request_bytes > u32::MAX as usize
             || self.max_inflight_request_bytes > Semaphore::MAX_PERMITS
         {
             return Err(GitHttpError::InvalidOptions(
-                "max_inflight_request_bytes exceeds the semaphore permit limit".into(),
+                "max_inflight_request_bytes must cover max_request_bytes and fit the semaphore"
+                    .into(),
             ));
         }
         self.max_pack_generations
@@ -402,192 +388,259 @@ fn validate_route(route: &str) -> Result<(), GitHttpError> {
     Ok(())
 }
 
+// Apply idle deadlines to the transport as well as the decoded request body.
+// Hyper's header deadline covers total header time; this wrapper catches a
+// stalled socket write while Hyper owns the response framing.
+struct TimedIo {
+    inner: TcpStream,
+    read_timeout: Duration,
+    write_timeout: Duration,
+    read_sleep: Option<Pin<Box<Sleep>>>,
+    write_sleep: Option<Pin<Box<Sleep>>>,
+    timed_out: Arc<AtomicU8>,
+}
+
+impl TimedIo {
+    fn new(inner: TcpStream, options: &GitHttpOptions, timed_out: Arc<AtomicU8>) -> Self {
+        Self {
+            inner,
+            read_timeout: options.idle_timeout,
+            write_timeout: options.response_write_timeout,
+            read_sleep: None,
+            write_sleep: None,
+            timed_out,
+        }
+    }
+    fn pending(
+        sleep: &mut Option<Pin<Box<Sleep>>>,
+        duration: Duration,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<usize>> {
+        let timer = sleep.get_or_insert_with(|| Box::pin(tokio::time::sleep(duration)));
+        if timer.as_mut().poll(cx).is_ready() {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "socket idle timeout",
+            )))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl AsyncRead for TimedIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(result) => {
+                self.read_sleep = None;
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                let deadline = self.read_timeout;
+                match Self::pending(&mut self.read_sleep, deadline, cx) {
+                    Poll::Ready(Err(error)) => {
+                        self.timed_out.store(1, Ordering::Relaxed);
+                        Poll::Ready(Err(error))
+                    }
+                    _ => Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+impl AsyncWrite for TimedIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match Pin::new(&mut self.inner).poll_write(cx, buf) {
+            Poll::Ready(result) => {
+                self.write_sleep = None;
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                let deadline = self.write_timeout;
+                match Self::pending(&mut self.write_sleep, deadline, cx) {
+                    Poll::Ready(Err(error)) => {
+                        self.timed_out.store(2, Ordering::Relaxed);
+                        Poll::Ready(Err(error))
+                    }
+                    _ => Poll::Pending,
+                }
+            }
+        }
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 #[tracing::instrument(name = "git.http.request", skip_all)]
 async fn handle_connection<PS, SS>(
-    mut stream: TcpStream,
+    stream: TcpStream,
+    route: String,
+    service: GitFetchService<PS, SS>,
+    options: GitHttpOptions,
+    pack_generations: Arc<Semaphore>,
+    request_bytes: Arc<Semaphore>,
+) -> Result<ServedRequest, GitHttpError>
+where
+    PS: BlobStore + Clone + Send + Sync + 'static,
+    SS: MetadataStore + Clone + Send + Sync + 'static,
+{
+    let result_slot = Arc::new(Mutex::new(None));
+    let timed_out = Arc::new(AtomicU8::new(0));
+    let request_seen = Arc::new(AtomicU8::new(0));
+    let handler_options = options.clone();
+    let handler = service_fn({
+        let result_slot = result_slot.clone();
+        let request_seen = request_seen.clone();
+        move |request: Request<Incoming>| {
+            let route = route.clone();
+            let service = service.clone();
+            let options = handler_options.clone();
+            let pack_generations = pack_generations.clone();
+            let request_bytes = request_bytes.clone();
+            let result_slot = result_slot.clone();
+            let request_seen = request_seen.clone();
+            async move {
+                request_seen.store(1, Ordering::Relaxed);
+                let method = request.method().to_string();
+                let target = request.uri().to_string();
+                let result = handle_request(
+                    request,
+                    &route,
+                    &service,
+                    &options,
+                    pack_generations,
+                    request_bytes,
+                )
+                .await;
+                let response = match result {
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        *result_slot.lock().unwrap() = Some(Ok(ServedRequest {
+                            method,
+                            target,
+                            status,
+                        }));
+                        response
+                    }
+                    Err(error) => {
+                        let status = match error {
+                            GitHttpError::Timeout(_) => StatusCode::REQUEST_TIMEOUT,
+                            GitHttpError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+                            _ => StatusCode::INTERNAL_SERVER_ERROR,
+                        };
+                        *result_slot.lock().unwrap() = Some(Err(error));
+                        text_response(status, "invalid Git HTTP request\n")
+                    }
+                };
+                Ok::<_, Infallible>(response)
+            }
+        }
+    });
+    let mut builder = http1::Builder::new();
+    builder
+        .keep_alive(false)
+        .timer(TokioTimer::new())
+        .header_read_timeout(options.header_timeout)
+        .max_buf_size(MAX_HTTP_HEADERS);
+    let io = TokioIo::new(TimedIo::new(stream, &options, timed_out.clone()));
+    let connection = builder.serve_connection(io, handler);
+    let wire_result = connection.await;
+    if timed_out.load(Ordering::Relaxed) == 2 {
+        return Err(GitHttpError::Timeout(GitHttpTimeout::ResponseWrite));
+    }
+    if timed_out.load(Ordering::Relaxed) == 1 {
+        return Err(GitHttpError::Timeout(GitHttpTimeout::Idle));
+    }
+    if let Err(error) = wire_result {
+        if request_seen.load(Ordering::Relaxed) == 0 && error.is_timeout() {
+            return Err(GitHttpError::Timeout(GitHttpTimeout::Headers));
+        }
+        return Err(GitHttpError::InvalidRequest(error.to_string()));
+    }
+    let mut slot = result_slot.lock().unwrap();
+    slot.take().unwrap_or_else(|| {
+        Err(GitHttpError::InvalidRequest(
+            "no HTTP request was served".into(),
+        ))
+    })
+}
+
+async fn handle_request<PS, SS>(
+    request: Request<Incoming>,
     route: &str,
     service: &GitFetchService<PS, SS>,
     options: &GitHttpOptions,
     pack_generations: Arc<Semaphore>,
     request_bytes: Arc<Semaphore>,
-) -> Result<ServedRequest, GitHttpError>
+) -> Result<Response<HttpBody>, GitHttpError>
 where
-    PS: BlobStore + Clone,
-    SS: MetadataStore + Clone,
+    PS: BlobStore + Clone + Send + Sync + 'static,
+    SS: MetadataStore + Clone + Send + Sync + 'static,
 {
-    let mut request = Vec::new();
-    let header_end = timeout(options.header_timeout, async {
-        loop {
-            if request.len() >= MAX_HTTP_HEADERS {
-                return Ok(None);
-            }
-            let mut buffer = [0u8; 4096];
-            let read = timeout(options.idle_timeout, stream.read(&mut buffer))
-                .await
-                .map_err(|_| GitHttpError::Timeout(GitHttpTimeout::Idle))??;
-            if read == 0 {
-                return Err(GitHttpError::InvalidRequest(
-                    "connection ended before headers".into(),
-                ));
-            }
-            request.extend_from_slice(&buffer[..read]);
-            if let Some(offset) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                return Ok(Some(offset + 4));
-            }
+    let target = request.uri().to_string();
+    if request.method() == Method::GET {
+        if target != format!("{route}/info/refs?service=git-upload-pack") {
+            return Ok(text_response(StatusCode::NOT_FOUND, "not found\n"));
         }
-    })
-    .await
-    .map_err(|_| GitHttpError::Timeout(GitHttpTimeout::Headers))??;
-    let Some(header_end) = header_end else {
-        write_response(
-            &mut stream,
-            431,
-            "text/plain; charset=utf-8",
-            b"request headers too large\n",
-            options,
-        )
-        .await?;
-        return Ok(ServedRequest {
-            method: String::new(),
-            target: String::new(),
-            status: 431,
+        return Ok(match service.info_refs() {
+            Ok(body) => response(
+                StatusCode::OK,
+                "application/x-git-upload-pack-advertisement",
+                body,
+            ),
+            Err(error) => fetch_error_response(error),
         });
+    }
+    if request.method() != Method::POST || target != format!("{route}/git-upload-pack") {
+        return Ok(text_response(StatusCode::NOT_FOUND, "not found\n"));
+    }
+    let coding = content_coding(request.headers())?;
+    if coding == BodyCoding::Unsupported {
+        return Ok(text_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported Content-Encoding\n",
+        ));
+    }
+    let max_request_bytes = service.limits().max_request_bytes;
+    if !request.headers().contains_key(header::CONTENT_LENGTH)
+        && !request.headers().contains_key(header::TRANSFER_ENCODING)
+    {
+        return Err(GitHttpError::InvalidRequest(
+            "POST requires Content-Length or chunked Transfer-Encoding".into(),
+        ));
+    }
+    let declared = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if declared.is_some_and(|length| length > max_request_bytes) {
+        return Ok(text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "upload-pack request too large\n",
+        ));
+    }
+    let budget = if coding == BodyCoding::Identity {
+        declared.unwrap_or(max_request_bytes)
+    } else {
+        max_request_bytes
     };
-    let headers = std::str::from_utf8(&request[..header_end])
-        .map_err(|_| GitHttpError::InvalidRequest("headers are not UTF-8/ASCII".into()))?;
-    let mut lines = headers.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or_else(|| GitHttpError::InvalidRequest("missing request line".into()))?;
-    let mut parts = request_line.split_ascii_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| GitHttpError::InvalidRequest("missing method".into()))?
-        .to_owned();
-    let target = parts
-        .next()
-        .ok_or_else(|| GitHttpError::InvalidRequest("missing request target".into()))?
-        .to_owned();
-    if parts.next() != Some("HTTP/1.1") || parts.next().is_some() {
-        return Err(GitHttpError::InvalidRequest(
-            "only one HTTP/1.1 request line is accepted".into(),
-        ));
-    }
-    let mut content_length = None;
-    let mut expect_continue = false;
-    for line in lines.filter(|line| !line.is_empty()) {
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| GitHttpError::InvalidRequest("malformed header".into()))?;
-        let value = value.trim();
-        if name.eq_ignore_ascii_case("content-length") {
-            if content_length.is_some() {
-                return Err(GitHttpError::InvalidRequest(
-                    "duplicate Content-Length".into(),
-                ));
-            }
-            content_length = Some(
-                value
-                    .parse::<usize>()
-                    .map_err(|_| GitHttpError::InvalidRequest("invalid Content-Length".into()))?,
-            );
-        } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            return Err(GitHttpError::InvalidRequest(
-                "Transfer-Encoding is not supported".into(),
-            ));
-        } else if name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue")
-        {
-            expect_continue = true;
-        }
-    }
-
-    if method == "GET" {
-        let expected = format!("{route}/info/refs?service=git-upload-pack");
-        if target != expected {
-            write_response(
-                &mut stream,
-                404,
-                "text/plain; charset=utf-8",
-                b"not found\n",
-                options,
-            )
-            .await?;
-            return Ok(ServedRequest {
-                method,
-                target,
-                status: 404,
-            });
-        }
-        let status = match service.info_refs() {
-            Ok(body) => {
-                write_response(
-                    &mut stream,
-                    200,
-                    "application/x-git-upload-pack-advertisement",
-                    &body,
-                    options,
-                )
-                .await?;
-                200
-            }
-            Err(error) => write_fetch_error(&mut stream, error, options).await?,
-        };
-        return Ok(ServedRequest {
-            method,
-            target,
-            status,
-        });
-    }
-
-    if method != "POST" || target != format!("{route}/git-upload-pack") {
-        write_response(
-            &mut stream,
-            404,
-            "text/plain; charset=utf-8",
-            b"not found\n",
-            options,
-        )
-        .await?;
-        return Ok(ServedRequest {
-            method,
-            target,
-            status: 404,
-        });
-    }
-    let content_length = content_length
-        .ok_or_else(|| GitHttpError::InvalidRequest("POST requires Content-Length".into()))?;
-    if content_length > service.limits().max_request_bytes {
-        write_response(
-            &mut stream,
-            413,
-            "text/plain; charset=utf-8",
-            b"upload-pack request too large\n",
-            options,
-        )
-        .await?;
-        return Ok(ServedRequest {
-            method,
-            target,
-            status: 413,
-        });
-    }
-    if expect_continue {
-        write_all_timed(
-            &mut stream,
-            b"HTTP/1.1 100 Continue\r\n\r\n",
-            options.response_write_timeout,
-        )
-        .await?;
-    }
-    let already = request.len() - header_end;
-    if already > content_length {
-        return Err(GitHttpError::InvalidRequest(
-            "request carries bytes beyond Content-Length".into(),
-        ));
-    }
-    let body_permits = u32::try_from(content_length)
+    let body_permits = u32::try_from(budget)
         .map_err(|_| GitHttpError::InvalidRequest("request body length exceeds u32".into()))?;
-    let _body_budget = timeout(options.request_body_timeout, async {
+    let received = timeout(options.request_body_timeout, async {
         let permit = if body_permits == 0 {
             None
         } else {
@@ -600,32 +653,40 @@ where
                     })?,
             )
         };
-        request.resize(header_end + content_length, 0);
-        let mut received = already;
-        while received < content_length {
-            let read = timeout(
-                options.idle_timeout,
-                stream.read(&mut request[header_end + received..header_end + content_length]),
-            )
-            .await
-            .map_err(|_| GitHttpError::Timeout(GitHttpTimeout::Idle))??;
-            if read == 0 {
-                return Err(GitHttpError::InvalidRequest(
-                    "connection ended before request body".into(),
-                ));
-            }
-            received += read;
-        }
-        Ok::<_, GitHttpError>(permit)
+        let body = read_request_body(
+            request.into_body(),
+            coding,
+            max_request_bytes,
+            options.idle_timeout,
+        )
+        .await?;
+        Ok::<_, BodyError>((permit, body))
     })
     .await
-    .map_err(|_| GitHttpError::Timeout(GitHttpTimeout::RequestBody))??;
-    match service.prepare_upload_pack(&request[header_end..]).await {
+    .map_err(|_| GitHttpError::Timeout(GitHttpTimeout::RequestBody))?;
+    let (_body_budget, body) = match received {
+        Ok(value) => value,
+        Err(BodyError::TooLarge) => {
+            return Ok(text_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "upload-pack request too large\n",
+            ));
+        }
+        Err(BodyError::Http(error)) => return Err(error),
+    };
+    if body == b"0000" {
+        return Ok(response(
+            StatusCode::OK,
+            "application/x-git-upload-pack-result",
+            Bytes::new(),
+        ));
+    }
+    match service.prepare_upload_pack(&body).await {
         Ok(prepared) => {
-            let pack_deadline = prepared
+            let deadline = prepared
                 .done()
                 .then(|| tokio::time::Instant::now() + options.pack_generation_timeout);
-            let _pack_permit = if let Some(deadline) = pack_deadline {
+            let _permit = if let Some(deadline) = deadline {
                 Some(
                     tokio::time::timeout_at(deadline, pack_generations.acquire_owned())
                         .await
@@ -637,50 +698,70 @@ where
             } else {
                 None
             };
-            write_streaming_upload_pack(&mut stream, service, prepared, options, pack_deadline)
-                .await?;
-            Ok(ServedRequest {
-                method,
-                target,
-                status: 200,
-            })
+            // Keep the permit for the lifetime of the streamed body.
+            Ok(streaming_response(
+                service.clone(),
+                prepared,
+                options,
+                deadline,
+                _permit,
+            ))
         }
-        Err(error) => {
-            let status = write_fetch_error(&mut stream, error, options).await?;
-            Ok(ServedRequest {
-                method,
-                target,
-                status,
-            })
-        }
+        Err(error) => Ok(fetch_error_response(error)),
     }
 }
 
+fn response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: impl Into<Bytes>,
+) -> Response<HttpBody> {
+    let body = body.into();
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "close")
+        .header(header::CONTENT_LENGTH, body.len().to_string())
+        .body(
+            Full::new(body)
+                .map_err(|never| match never {})
+                .boxed_unsync(),
+        )
+        .unwrap()
+}
+
+fn text_response(status: StatusCode, body: &'static str) -> Response<HttpBody> {
+    response(status, "text/plain; charset=utf-8", body)
+}
+
+fn fetch_error_response(error: GitFetchError) -> Response<HttpBody> {
+    let status = match error {
+        GitFetchError::UnauthorizedOid(_) => StatusCode::FORBIDDEN,
+        GitFetchError::Protocol(_) | GitFetchError::Limit(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    response(status, "text/plain; charset=utf-8", format!("{error}\n"))
+}
+
 #[tracing::instrument(name = "git.http.stream_pack", skip_all)]
-async fn write_streaming_upload_pack<PS, SS>(
-    stream: &mut TcpStream,
-    service: &GitFetchService<PS, SS>,
+fn streaming_response<PS, SS>(
+    service: GitFetchService<PS, SS>,
     prepared: crate::git::fetch::PreparedUploadPack,
     options: &GitHttpOptions,
-    pack_deadline: Option<tokio::time::Instant>,
-) -> Result<(), GitHttpError>
+    deadline: Option<tokio::time::Instant>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Response<HttpBody>
 where
-    PS: BlobStore + Clone,
-    SS: MetadataStore + Clone,
+    PS: BlobStore + Clone + Send + Sync + 'static,
+    SS: MetadataStore + Clone + Send + Sync + 'static,
 {
     let content_length = prepared.response_bytes();
-    write_response_header(
-        stream,
-        200,
-        "application/x-git-upload-pack-result",
-        content_length,
-        options,
-    )
-    .await?;
-    let aggregate_transport_chunks = prepared.uses_cached_pack();
+    let aggregate = prepared.uses_cached_pack();
     let (mut producer, mut consumer) = tokio::io::duplex(options.response_buffer_bytes);
-    let generate = async {
-        let result = if let Some(deadline) = pack_deadline {
+    let generation = tokio::spawn(async move {
+        let _permit = permit;
+        let result = if let Some(deadline) = deadline {
             tokio::time::timeout_at(
                 deadline,
                 service.write_prepared_upload_pack_to(prepared, &mut producer),
@@ -694,124 +775,217 @@ where
         };
         producer.shutdown().await?;
         result.map_err(GitHttpError::Fetch)
-    };
-    let send = async {
-        let mut buffer = vec![0u8; options.response_buffer_bytes];
+    });
+    let buffer_size = options.response_buffer_bytes;
+    let stream = async_stream::try_stream! {
+        let mut buffer = vec![0u8; buffer_size];
         loop {
-            // Side-band payloads arrive in roughly 64 KiB writes. Fill one
-            // transport buffer before emitting an HTTP chunk so a multi-GiB
-            // pack does not turn into three timed socket writes per side-band
-            // frame. EOF still flushes the final partial chunk.
-            let mut read = 0;
-            while read < buffer.len() {
-                let next = consumer.read(&mut buffer[read..]).await?;
-                if next == 0 {
-                    break;
-                }
-                read += next;
-                if !aggregate_transport_chunks {
-                    break;
+            let mut size = consumer.read(&mut buffer).await?;
+            if size == 0 { break; }
+            if aggregate {
+                while size < buffer.len() {
+                    let next = consumer.read(&mut buffer[size..]).await?;
+                    if next == 0 { break; }
+                    size += next;
                 }
             }
-            if read == 0 {
-                break;
-            }
-            if content_length.is_some() {
-                write_all_timed(stream, &buffer[..read], options.response_write_timeout).await?;
-            } else {
-                write_all_timed(
-                    stream,
-                    format!("{read:x}\r\n").as_bytes(),
-                    options.response_write_timeout,
-                )
-                .await?;
-                write_all_timed(stream, &buffer[..read], options.response_write_timeout).await?;
-                write_all_timed(stream, b"\r\n", options.response_write_timeout).await?;
+            yield Frame::data(Bytes::copy_from_slice(&buffer[..size]));
+        }
+        generation.await.map_err(std::io::Error::other)?
+            .map_err(std::io::Error::other)?;
+    };
+    let body = StreamBody::new(stream).boxed_unsync();
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "close");
+    if let Some(length) = content_length {
+        builder = builder.header(header::CONTENT_LENGTH, length.to_string());
+    }
+    builder.body(body).unwrap()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyCoding {
+    Identity,
+    Gzip,
+    Unsupported,
+}
+
+fn content_coding(headers: &HeaderMap) -> Result<BodyCoding, GitHttpError> {
+    let mut values = headers.get_all(header::CONTENT_ENCODING).iter();
+    let value = values.next();
+    if values.next().is_some() {
+        return Err(GitHttpError::InvalidRequest(
+            "duplicate Content-Encoding".into(),
+        ));
+    }
+    Ok(match value.and_then(|value| value.to_str().ok()) {
+        None => BodyCoding::Identity,
+        Some(value) if value.eq_ignore_ascii_case("identity") => BodyCoding::Identity,
+        Some(value)
+            if value.eq_ignore_ascii_case("gzip") || value.eq_ignore_ascii_case("x-gzip") =>
+        {
+            BodyCoding::Gzip
+        }
+        _ => BodyCoding::Unsupported,
+    })
+}
+
+#[derive(Debug)]
+enum BodyError {
+    TooLarge,
+    Http(GitHttpError),
+}
+impl From<GitHttpError> for BodyError {
+    fn from(error: GitHttpError) -> Self {
+        Self::Http(error)
+    }
+}
+fn invalid_body(message: &str) -> BodyError {
+    BodyError::Http(GitHttpError::InvalidRequest(message.into()))
+}
+
+struct BoundedBody {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+impl std::io::Write for BoundedBody {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() > self.limit - self.bytes.len() {
+            self.exceeded = true;
+            return Err(std::io::Error::other("request body exceeds limit"));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+enum BodyDecoder {
+    Identity(BoundedBody),
+    Gzip(Box<flate2::write::GzDecoder<BoundedBody>>),
+}
+impl BodyDecoder {
+    fn new(coding: BodyCoding, limit: usize) -> Result<Self, BodyError> {
+        let body = BoundedBody {
+            bytes: Vec::new(),
+            limit,
+            exceeded: false,
+        };
+        match coding {
+            BodyCoding::Identity => Ok(Self::Identity(body)),
+            BodyCoding::Gzip => Ok(Self::Gzip(Box::new(flate2::write::GzDecoder::new(body)))),
+            BodyCoding::Unsupported => Err(invalid_body("unsupported Content-Encoding")),
+        }
+    }
+    fn write(&mut self, bytes: &[u8]) -> Result<(), BodyError> {
+        use std::io::Write;
+        let result = match self {
+            Self::Identity(body) => body.write_all(bytes),
+            Self::Gzip(decoder) => decoder.write_all(bytes),
+        };
+        result.map_err(|_| self.error())
+    }
+    fn finish(self) -> Result<Vec<u8>, BodyError> {
+        match self {
+            Self::Identity(body) => Ok(body.bytes),
+            Self::Gzip(mut decoder) => {
+                if decoder.try_finish().is_err() {
+                    return Err(Self::Gzip(decoder).error());
+                }
+                Ok(std::mem::take(&mut decoder.get_mut().bytes))
             }
         }
-        Ok::<(), GitHttpError>(())
-    };
-    tokio::try_join!(generate, send)?;
-    if content_length.is_none() {
-        write_all_timed(stream, b"0\r\n\r\n", options.response_write_timeout).await?;
     }
-    timeout(options.response_write_timeout, stream.shutdown())
+    fn error(&self) -> BodyError {
+        let exceeded = match self {
+            Self::Identity(body) => body.exceeded,
+            Self::Gzip(decoder) => decoder.get_ref().exceeded,
+        };
+        if exceeded {
+            BodyError::TooLarge
+        } else {
+            invalid_body("invalid gzip request body")
+        }
+    }
+}
+
+async fn read_request_body(
+    mut incoming: Incoming,
+    coding: BodyCoding,
+    limit: usize,
+    idle_timeout: Duration,
+) -> Result<Vec<u8>, BodyError> {
+    let mut decoder = BodyDecoder::new(coding, limit)?;
+    let mut received = 0usize;
+    while let Some(frame) = timeout(idle_timeout, incoming.frame())
         .await
-        .map_err(|_| GitHttpError::Timeout(GitHttpTimeout::ResponseWrite))??;
-    Ok(())
+        .map_err(|_| BodyError::Http(GitHttpError::Timeout(GitHttpTimeout::Idle)))?
+    {
+        let frame = frame.map_err(|error| invalid_body(&error.to_string()))?;
+        if let Ok(data) = frame.into_data() {
+            received = received
+                .checked_add(data.len())
+                .ok_or(BodyError::TooLarge)?;
+            if received > limit {
+                return Err(BodyError::TooLarge);
+            }
+            decoder.write(&data)?;
+        }
+    }
+    decoder.finish()
 }
 
-async fn write_fetch_error(
-    stream: &mut TcpStream,
-    error: GitFetchError,
-    options: &GitHttpOptions,
-) -> Result<u16, GitHttpError> {
-    let status = match error {
-        GitFetchError::UnauthorizedOid(_) => 403,
-        GitFetchError::Protocol(_) | GitFetchError::Limit(_) => 400,
-        _ => 500,
-    };
-    write_response(
-        stream,
-        status,
-        "text/plain; charset=utf-8",
-        format!("{error}\n").as_bytes(),
-        options,
-    )
-    .await?;
-    Ok(status)
-}
+#[cfg(test)]
+mod body_tests {
+    use std::io::Write;
 
-async fn write_response(
-    stream: &mut TcpStream,
-    status: u16,
-    content_type: &str,
-    body: &[u8],
-    options: &GitHttpOptions,
-) -> Result<(), GitHttpError> {
-    write_response_header(stream, status, content_type, Some(body.len()), options).await?;
-    write_all_timed(stream, body, options.response_write_timeout).await?;
-    timeout(options.response_write_timeout, stream.shutdown())
-        .await
-        .map_err(|_| GitHttpError::Timeout(GitHttpTimeout::ResponseWrite))??;
-    Ok(())
-}
+    use super::*;
 
-async fn write_response_header(
-    stream: &mut TcpStream,
-    status: u16,
-    content_type: &str,
-    content_length: Option<usize>,
-    options: &GitHttpOptions,
-) -> Result<(), GitHttpError> {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        404 => "Not Found",
-        413 => "Content Too Large",
-        431 => "Request Header Fields Too Large",
-        _ => "Internal Server Error",
-    };
-    let framing = content_length.map_or_else(
-        || "Transfer-Encoding: chunked\r\n".to_owned(),
-        |length| format!("Content-Length: {length}\r\n"),
-    );
-    let header = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{framing}Cache-Control: no-cache\r\nConnection: close\r\n\r\n"
-    );
-    write_all_timed(stream, header.as_bytes(), options.response_write_timeout).await
-}
+    fn gzip(input: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(input).unwrap();
+        encoder.finish().unwrap()
+    }
 
-async fn write_all_timed(
-    stream: &mut TcpStream,
-    bytes: &[u8],
-    deadline: Duration,
-) -> Result<(), GitHttpError> {
-    timeout(deadline, stream.write_all(bytes))
-        .await
-        .map_err(|_| GitHttpError::Timeout(GitHttpTimeout::ResponseWrite))??;
-    Ok(())
+    #[test]
+    fn gzip_output_is_bounded_while_decoding() {
+        let compressed = gzip(&vec![0; 64 * 1024]);
+        let mut decoder = BodyDecoder::new(BodyCoding::Gzip, 1024).unwrap();
+        assert!(matches!(
+            decoder.write(&compressed),
+            Err(BodyError::TooLarge)
+        ));
+
+        let mut decoder = BodyDecoder::new(BodyCoding::Gzip, 64 * 1024).unwrap();
+        decoder.write(&compressed).unwrap();
+        assert_eq!(decoder.finish().unwrap().len(), 64 * 1024);
+    }
+
+    #[test]
+    fn malformed_gzip_is_rejected() {
+        let valid = gzip(b"payload");
+        let mut corrupt_crc = valid.clone();
+        let crc = corrupt_crc.len() - 8;
+        corrupt_crc[crc] ^= 1;
+        let mut trailing = valid.clone();
+        trailing.extend_from_slice(b"extra");
+        for bytes in [
+            b"not gzip".as_slice(),
+            &valid[..valid.len() - 4],
+            &corrupt_crc,
+            &trailing,
+        ] {
+            let mut decoder = BodyDecoder::new(BodyCoding::Gzip, 1024).unwrap();
+            let result = decoder.write(bytes).and_then(|()| decoder.finish());
+            assert!(matches!(result, Err(BodyError::Http(_))));
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1190,6 +1364,175 @@ mod tests {
         );
         let format = git(&checkout, &["rev-parse", "--show-object-format"]);
         assert_eq!(String::from_utf8_lossy(&format.stdout).trim(), "sha256");
+    }
+
+    /// Stock Git gzips upload-pack bodies above 1 KiB and streams them with
+    /// chunked framing once they exceed `http.postBuffer`, which Git never
+    /// lowers below one 64 KiB packet. Many advertised branches produce one
+    /// want line each, so fetching a subset exercises gzip and a full clone
+    /// with the smallest post buffer exercises chunked framing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unmodified_git_client_sends_gzip_and_chunked_request_bodies() {
+        const BRANCHES: usize = 1_500;
+        let git = |directory: &std::path::Path, args: &[&str], input: Option<&[u8]>| {
+            let mut child = Command::new("git")
+                .current_dir(directory)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            if let Some(input) = input {
+                std::io::Write::write_all(&mut stdin, input).unwrap();
+            }
+            drop(stdin);
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        let source = tempfile::tempdir().unwrap();
+        git(source.path(), &["init", "-q", "-b", "main"], None);
+        let mut stream = String::new();
+        for index in 0..BRANCHES {
+            let content = format!("{index}\n");
+            stream.push_str(&format!(
+                "commit refs/heads/b{index:04}\nmark :{}\ncommitter test <test@example.com> 0 +0000\ndata 1\nx\n",
+                index + 1
+            ));
+            if index > 0 {
+                stream.push_str(&format!("from :{index}\n"));
+            }
+            stream.push_str(&format!(
+                "M 644 inline file\ndata {}\n{content}\n",
+                content.len()
+            ));
+        }
+        stream.push_str(&format!("reset refs/heads/main\nfrom :{BRANCHES}\n\n"));
+        git(
+            source.path(),
+            &["fast-import", "--quiet"],
+            Some(stream.as_bytes()),
+        );
+
+        let repository = Repository::memory().unwrap();
+        repository
+            .import_native_git_view(
+                source.path(),
+                &NativeGitImportOptions {
+                    view_name: "branches".into(),
+                    refs: Vec::new(),
+                    ..NativeGitImportOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let service = GitFetchService::bind(&repository, "branches", GitFetchLimits::default())
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_git_smart_http(
+            listener,
+            "/branches.git".into(),
+            service,
+        ));
+        let url = format!("http://{address}/branches.git");
+
+        // One hundred wants encode to about 5 KiB: gzip with Content-Length.
+        let client = tempfile::tempdir().unwrap();
+        git(client.path(), &["init", "-q", "--bare"], None);
+        git(
+            client.path(),
+            &[
+                "fetch",
+                "--quiet",
+                &url,
+                "+refs/heads/b00*:refs/remotes/origin/b00*",
+            ],
+            None,
+        );
+        let fetched = git(
+            client.path(),
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/remotes/origin/",
+            ],
+            None,
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&fetched.stdout).lines().count(),
+            100
+        );
+
+        // Every branch as a want encodes to about 75 KiB, which exceeds the
+        // smallest post buffer Git accepts: chunked framing without gzip.
+        let checkout_parent = tempfile::tempdir().unwrap();
+        let checkout = checkout_parent.path().join("clone");
+        git(
+            checkout_parent.path(),
+            &[
+                "-c",
+                "http.postBuffer=1024",
+                "clone",
+                "--quiet",
+                "--mirror",
+                &url,
+                checkout.to_str().unwrap(),
+            ],
+            None,
+        );
+
+        // Unsupported codings are refused before any body byte is read, and
+        // the lone flush probe Git sends ahead of a chunked request succeeds.
+        for (headers, body, status) in [
+            ("Content-Length: 0\r\nContent-Encoding: br\r\n", "", "415"),
+            // Hyper rejects unsupported transfer framing before dispatch.
+            ("Transfer-Encoding: gzip\r\n", "", "400"),
+            ("Content-Length: 4\r\n", "0000", "200"),
+        ] {
+            let mut connection = TcpStream::connect(address).await.unwrap();
+            connection
+                .write_all(
+                    format!(
+                        "POST /branches.git/git-upload-pack HTTP/1.1\r\nHost: test\r\n{headers}\r\n{body}"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            connection.read_to_end(&mut response).await.unwrap();
+            let response = String::from_utf8_lossy(&response);
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{headers:?}: {response}"
+            );
+        }
+        server.abort();
+        let _ = server.await;
+        let cloned = git(
+            &checkout,
+            &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+            None,
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&cloned.stdout).lines().count(),
+            BRANCHES + 1
+        );
+        git(
+            &checkout,
+            &["fsck", "--full", "--strict", "--no-progress"],
+            None,
+        );
     }
 
     /// Exercise the full smart-HTTP update path at the scale which exposed
