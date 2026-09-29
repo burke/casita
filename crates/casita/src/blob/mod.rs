@@ -20,6 +20,8 @@ mod chunked_reader;
 mod combined;
 #[cfg(test)]
 pub(crate) mod crash_tests;
+pub(crate) mod deletion_barrier;
+pub use deletion_barrier::CommitDurability;
 mod hashing_reader;
 mod local_durability;
 mod memory;
@@ -356,6 +358,15 @@ pub trait BlobStore: Send + Sync {
     /// the capability of the store receiving its writes, and a leaf store
     /// states whether each closed writer is already durable.
     fn publication(&self) -> PayloadPublication<'_>;
+
+    /// Make every later deletion wait until `commits` has made the metadata
+    /// store's acknowledged commits durable, so a payload never leaves storage
+    /// while the commit that made it unreachable is still volatile. The
+    /// repository calls this when it pairs this store with such a metadata
+    /// store. Stores that delete must honour it and wrappers must forward it;
+    /// the default suits stores that never delete.
+    #[doc(hidden)]
+    fn order_deletions_after(&self, _commits: CommitDurability) {}
 
     /// Write `data` as a blob and return its digest.
     ///

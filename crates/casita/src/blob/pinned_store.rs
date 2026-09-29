@@ -121,11 +121,20 @@ pub(crate) async fn delete_pinned_groups(
 pub(crate) struct PinnedObjectStore {
     inner: Arc<dyn ObjectStore>,
     pins: PinBindings,
+    deletions: super::deletion_barrier::DeletionBarrier,
 }
 
 impl PinnedObjectStore {
-    pub(crate) fn wrap(inner: Arc<dyn ObjectStore>, pins: PinBindings) -> Arc<dyn ObjectStore> {
-        Arc::new(Self { inner, pins })
+    pub(crate) fn wrap(
+        inner: Arc<dyn ObjectStore>,
+        pins: PinBindings,
+        deletions: super::deletion_barrier::DeletionBarrier,
+    ) -> Arc<dyn ObjectStore> {
+        Arc::new(Self {
+            inner,
+            pins,
+            deletions,
+        })
     }
 }
 
@@ -206,11 +215,22 @@ impl ObjectStore for PinnedObjectStore {
         self.inner.get_opts(location, options).await
     }
 
+    /// Every deletion waits for the barrier, so it cannot reach storage ahead
+    /// of the metadata commit that allowed it.
     fn delete_stream(
         &self,
         locations: BoxStream<'static, object_store::Result<Path>>,
     ) -> BoxStream<'static, object_store::Result<Path>> {
-        self.inner.delete_stream(locations)
+        let inner = self.inner.clone();
+        let deletions = self.deletions.clone();
+        futures::stream::once(async move {
+            match deletions.before_deletion().await {
+                Ok(()) => inner.delete_stream(locations),
+                Err(failure) => futures::stream::iter([Err(error(failure))]).boxed(),
+            }
+        })
+        .flatten()
+        .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -359,8 +379,11 @@ mod tests {
         .unwrap();
         let bindings = PinBindings::default();
         bindings.attach(&pin);
-        let store =
-            PinnedObjectStore::wrap(Arc::new(object_store::memory::InMemory::new()), bindings);
+        let store = PinnedObjectStore::wrap(
+            Arc::new(object_store::memory::InMemory::new()),
+            bindings,
+            Default::default(),
+        );
         let path = Path::from("pack");
         let mut upload = store.put_multipart(&path).await.unwrap();
         drop(pin);
@@ -388,5 +411,20 @@ mod tests {
         drop(upload);
         flush_repository_leases().await.unwrap();
         assert!(ledger.inventory().await.unwrap().pins.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deletion_that_cannot_flush_committed_state_never_reaches_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let unflushable = directory.path().join("missing/casita.sqlite");
+        let barrier = crate::blob::deletion_barrier::DeletionBarrier::default();
+        barrier.order_after(crate::blob::CommitDurability::for_database(&unflushable).unwrap());
+        let inner = Arc::new(object_store::memory::InMemory::new());
+        let store = PinnedObjectStore::wrap(inner.clone(), PinBindings::default(), barrier);
+        let path = Path::from("payload");
+        inner.put(&path, b"payload".to_vec().into()).await.unwrap();
+        assert!(store.delete(&path).await.is_err());
+        assert!(inner.head(&path).await.is_ok());
     }
 }

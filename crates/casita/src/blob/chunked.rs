@@ -356,6 +356,8 @@ pub struct ChunkedBlobStore {
     immutable_cache: bool,
     chunk_memory_budget: crate::byte_budget::ByteBudget,
     pins: crate::metadata::PinBindings,
+    /// Shared with every component that deletes; see [`BlobStore::order_deletions_after`].
+    deletions: super::deletion_barrier::DeletionBarrier,
 }
 
 impl ChunkedBlobStore {
@@ -370,7 +372,12 @@ impl ChunkedBlobStore {
     /// the average, subject to those bounds and rounding.
     pub fn new(object_store: Arc<dyn ObjectStore>, base_path: Path, avg_chunk_size: u32) -> Self {
         let pins = crate::metadata::PinBindings::default();
-        let object_store = super::pinned_store::PinnedObjectStore::wrap(object_store, pins.clone());
+        let deletions = super::deletion_barrier::DeletionBarrier::default();
+        let object_store = super::pinned_store::PinnedObjectStore::wrap(
+            object_store,
+            pins.clone(),
+            deletions.clone(),
+        );
         Self {
             object_store,
             base_path,
@@ -384,6 +391,7 @@ impl ChunkedBlobStore {
                 DEFAULT_CHUNK_MEMORY_BUDGET_BYTES,
             ),
             pins,
+            deletions,
         }
     }
 
@@ -416,8 +424,17 @@ impl ChunkedBlobStore {
             cache_capacity: pack_cache_capacity,
         } = options;
         let pins = crate::metadata::PinBindings::default();
-        let object_store = super::pinned_store::PinnedObjectStore::wrap(object_store, pins.clone());
-        let local_durability = local_durability.map(|local| local.with_pins(pins.clone()));
+        let deletions = super::deletion_barrier::DeletionBarrier::default();
+        let object_store = super::pinned_store::PinnedObjectStore::wrap(
+            object_store,
+            pins.clone(),
+            deletions.clone(),
+        );
+        let local_durability = local_durability.map(|local| {
+            local
+                .with_pins(pins.clone())
+                .with_deletion_barrier(deletions.clone())
+        });
         let packed_chunks = PackedChunks::open_with_initial_catalog(
             object_store.clone(),
             base_path.clone(),
@@ -440,6 +457,7 @@ impl ChunkedBlobStore {
                 DEFAULT_CHUNK_MEMORY_BUDGET_BYTES,
             ),
             pins,
+            deletions,
         })
     }
 
@@ -1321,6 +1339,10 @@ impl BlobStore for ChunkedBlobStore {
             Some(packed) => super::PayloadPublication::Cataloged(packed),
             None => super::PayloadPublication::Immediate,
         }
+    }
+
+    fn order_deletions_after(&self, commits: super::CommitDurability) {
+        self.deletions.order_after(commits);
     }
 
     async fn chunks(&self, digest: &BlobId) -> Result<Option<Vec<ChunkMeta>>, Error> {

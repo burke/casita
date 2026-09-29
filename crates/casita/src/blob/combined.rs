@@ -76,6 +76,10 @@ where
         self.near.publication()
     }
 
+    fn order_deletions_after(&self, commits: super::CommitDurability) {
+        self.near.order_deletions_after(commits);
+    }
+
     async fn has(&self, digest: &BlobId) -> Result<bool, Error> {
         Ok(self.near.has(digest).await? || self.far.has(digest).await?)
     }

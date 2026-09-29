@@ -1602,6 +1602,34 @@
       ]
     },
     {
+      "id": "deletion-ordering",
+      "suite_id": "collection-and-fsck",
+      "title": "Collection passes with and without deletions that wait for their commits",
+      "kind": "module",
+      "target": "benchmarks.suites.native_probes",
+      "default_arguments": [
+        "--probe",
+        "deletion-ordering"
+      ],
+      "profiles": [
+        "custom"
+      ]
+    },
+    {
+      "id": "metadata-durability",
+      "suite_id": "state-and-publication",
+      "title": "Turso commit latency with the production sync and with a drive-cache flush",
+      "kind": "module",
+      "target": "benchmarks.suites.native_probes",
+      "default_arguments": [
+        "--probe",
+        "metadata-durability"
+      ],
+      "profiles": [
+        "custom"
+      ]
+    },
+    {
       "id": "catalog-maintenance",
       "suite_id": "blob-backends",
       "title": "Catalog reclamation marker",
@@ -2495,6 +2523,7 @@
         "commit-stale",
         "commit-repoint-root",
         "commit-remove-root",
+        "commit-durability",
         "snapshot",
         "publish",
         "publish-if-roots-match",
@@ -2649,6 +2678,7 @@
         "fsck",
         "collect",
         "collect-with-reader",
+        "collect-ordered-deletions",
         "corruption-scan",
         "enospc-recovery"
       ],

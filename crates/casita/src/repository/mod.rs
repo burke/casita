@@ -211,6 +211,10 @@ impl<PS, SS> Repository<PS, SS> {
     {
         let payloads = Arc::new(payloads);
         let metadata = Arc::new(metadata);
+        // A payload deletion must not outrun the commit that allowed it.
+        if let Some(commits) = metadata.commit_durability() {
+            payloads.order_deletions_after(commits);
+        }
         let publication = Publication::new(payloads.clone(), metadata.clone());
         let nar_store = metadata
             .verification_facts()
@@ -325,6 +329,8 @@ where
     }
 }
 
+#[cfg(test)]
+mod collection_benchmark;
 #[cfg(test)]
 mod fsck_benchmark;
 

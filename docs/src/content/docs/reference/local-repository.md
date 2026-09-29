@@ -115,6 +115,16 @@ development-only schemas from before the first release must be recreated or
 re-imported. A future schema change will require an explicit offline migration
 rather than modifying a repository during ordinary open.
 
+Every commit syncs the WAL before it is acknowledged (`synchronous = FULL`).
+On Linux and Windows that sync reaches stable storage. On macOS it reaches the
+drive's volatile cache, so a power loss may discard the most recent
+acknowledged commits. Deletions that a commit allows (collection sweeps and
+catalog reclamation) first flush the drive cache (`F_FULLFSYNC`), so a power
+loss cannot keep those deletions while losing the commit behind them. The
+repository reopens consistent, at an earlier revision. Casita flushes before
+every deletion batch, rather than on every commit. WAL size and modification
+time cannot identify commits that finished syncing after an earlier flush.
+
 ## Physical payload behavior
 
 Payload identity is always BLAKE3 over complete plaintext bytes. The default

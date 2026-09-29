@@ -661,6 +661,16 @@ pub trait MetadataStore: Send + Sync {
         None
     }
 
+    /// How to make this store's acknowledged commits durable, for a store
+    /// whose acknowledgement can stop short of stable storage. The repository
+    /// hands it to the payload store, which applies it before deleting
+    /// anything a commit made unreachable. Stores durable on acknowledgement
+    /// return `None`; wrappers must forward it.
+    #[doc(hidden)]
+    fn commit_durability(&self) -> Option<crate::blob::CommitDurability> {
+        None
+    }
+
     /// Read only the requested application records from one consistent view.
     /// A backend may avoid loading unrelated object or payload catalogs when
     /// the caller needs neither a revision token nor a retained snapshot.

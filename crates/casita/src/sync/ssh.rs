@@ -295,6 +295,12 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 /// Host authentication, user authentication, encryption, proxy jumps, agent
 /// use, and known-host policy are all inherited from the user's OpenSSH
 /// configuration. Casita never weakens host-key checking.
+///
+/// Casita also bounds liveness, so a peer that stops answering fails the
+/// transfer instead of blocking it forever: connection setup must finish
+/// within 30 seconds, and keepalives over the encrypted channel detect a host
+/// or network that went silent within about 45 seconds. These command-line
+/// options take precedence over the same settings in `ssh_config`.
 #[derive(Debug, Clone)]
 pub struct SshTransferSource {
     endpoint: SshEndpoint,
@@ -324,11 +330,19 @@ impl SshTransferSource {
     }
 
     fn arguments(&self) -> Vec<OsString> {
-        let mut arguments = vec![
-            OsString::from("-T"),
-            OsString::from("-o"),
-            OsString::from("ClearAllForwardings=yes"),
-        ];
+        let mut arguments = [
+            "-T",
+            "-o",
+            "ClearAllForwardings=yes",
+            "-o",
+            "ConnectTimeout=30",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
+        ]
+        .map(OsString::from)
+        .to_vec();
         if let Some(port) = self.endpoint.port {
             arguments.push(OsString::from("-p"));
             arguments.push(OsString::from(port.to_string()));
@@ -2741,13 +2755,23 @@ mod tests {
 
         let source = SshTransferSource::new(endpoint);
         let arguments = source.arguments();
-        assert_eq!(arguments[0], OsStr::new("-T"));
-        assert_eq!(arguments[3], OsStr::new("-p"));
-        assert_eq!(arguments[5], OsStr::new("alice@example.com"));
-        assert_eq!(arguments[6], OsStr::new("casita"));
-        assert_eq!(arguments[7], OsStr::new("__ssh-source"));
+        // Options are complete `-o` pairs ahead of the destination, so no
+        // endpoint text can land in an option position.
+        let (options, command) = arguments.split_at(arguments.len() - 5);
+        let expected = "-T -o ClearAllForwardings=yes -o ConnectTimeout=30 \
+                        -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -p 2222";
+        assert_eq!(
+            options,
+            expected
+                .split_whitespace()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(command[0], OsStr::new("alice@example.com"));
+        assert_eq!(command[1], OsStr::new("casita"));
+        assert_eq!(command[2], OsStr::new("__ssh-source"));
         assert!(
-            arguments[9]
+            command[4]
                 .to_string_lossy()
                 .bytes()
                 .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') })

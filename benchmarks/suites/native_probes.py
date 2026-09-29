@@ -11,10 +11,15 @@ from benchmarks.suites.pack.catalog import build_probe_binary
 
 PROBES = {
     "state-publication": "metadata::benchmarks::benchmark_state_publication",
+    "metadata-durability": "metadata::benchmarks::benchmark_metadata_commit_durability",
+    "deletion-ordering": "repository::collection_benchmark::benchmark_collection_deletion_ordering",
     "catalog-maintenance": "blob::pack::benchmarks::benchmark_catalog_reclaim_marker_probe",
     "catalog-durability": "blob::pack::benchmarks::benchmark_local_catalog_durable_publication",
     "logical-state": "metadata::wal3_shard::tests::benchmark_logical_state_shards_scale",
 }
+
+# Probes outside the default suites of their name prefix.
+SUITES = {"deletion-ordering": "collection-and-fsck"}
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -31,6 +36,8 @@ def main(argv=None):
     binary = (args.probe_binary or build_probe_binary()).resolve()
     env = {**os.environ, "CASITA_STATE_BENCH_ITERATIONS": str(args.iterations),
         "CASITA_STATE_BENCH_WRITERS": str(args.writers),
+        "CASITA_METADATA_DURABILITY_BENCH_ITERATIONS": str(args.iterations),
+        "CASITA_DELETION_ORDERING_BENCH_ITERATIONS": str(args.iterations),
         "CASITA_CATALOG_MARKER_BENCH_ITERATIONS": str(args.iterations),
         "CASITA_CATALOG_DURABILITY_BENCH_ITERATIONS": str(args.iterations),
         "CASITA_LOGICAL_STATE_BENCH_ENTRIES": str(args.entries)}
@@ -52,7 +59,7 @@ def main(argv=None):
                 "repetition": repetition, **timing, "metrics": metrics, "stdout": output})
     common.write_atomic(args.output, json.dumps({"schema_version": 1,
         "result_schema": "casita.native-probes.v1",
-        "suite_id": "blob-backends" if args.probe.startswith("catalog-") else "state-and-publication",
+        "suite_id": SUITES.get(args.probe, "blob-backends" if args.probe.startswith("catalog-") else "state-and-publication"),
         "environment": environment,
         "configuration": vars(args) | {"probe_binary": str(binary), "output": str(args.output)},
         "samples": samples}, indent=2) + "\n")

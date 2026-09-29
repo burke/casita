@@ -3610,15 +3610,10 @@ async fn a_parked_reader_does_not_starve_a_second_reader_of_buffers() {
         out
     }
     let dir = tempfile::tempdir().unwrap();
-    let fs = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
-    let store = ChunkedBlobStore::packed_with_options(
-        Arc::new(fs),
-        Path::default(),
-        DEFAULT_AVG_CHUNK_SIZE,
-        crate::PackOptions::local(),
-    )
-    .await
-    .unwrap();
+    let store =
+        ChunkedBlobStore::local_packed_with_options(dir.path(), crate::PackOptions::local())
+            .await
+            .unwrap();
     let first = noise(1, 96 << 20);
     let second = noise(2, 96 << 20);
     let one = write_blob(&store, &first).await;

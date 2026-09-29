@@ -10,10 +10,11 @@
 pub use crate::blob::{
     BlobBatchGuard, BlobChunkSource, BlobGc, BlobIntegrityError, BlobReader, BlobRepairError,
     BlobStore, BlobStreamReader, BlobSync, BlobWriter, CatalogMaintenance, CatalogOutcome,
-    CatalogPublication, ChunkedBlobStore, CombinedBlobStore, DEFAULT_AVG_CHUNK_SIZE,
-    DEFAULT_CHUNK_MEMORY_BUDGET_BYTES, DEFAULT_LOCAL_PACK_TARGET_SIZE, DEFAULT_PACK_CACHE_CAPACITY,
-    DEFAULT_PACK_COMPACTION_DEAD_PERCENT, DEFAULT_PACK_TARGET_SIZE, MemoryBlobStore, PackOptions,
-    PackReadStats, PayloadPublication, PreparedCatalog, RepairingBlobStore, is_integrity_error,
+    CatalogPublication, ChunkedBlobStore, CombinedBlobStore, CommitDurability,
+    DEFAULT_AVG_CHUNK_SIZE, DEFAULT_CHUNK_MEMORY_BUDGET_BYTES, DEFAULT_LOCAL_PACK_TARGET_SIZE,
+    DEFAULT_PACK_CACHE_CAPACITY, DEFAULT_PACK_COMPACTION_DEAD_PERCENT, DEFAULT_PACK_TARGET_SIZE,
+    MemoryBlobStore, PackOptions, PackReadStats, PayloadPublication, PreparedCatalog,
+    RepairingBlobStore, is_integrity_error,
 };
 pub use crate::casitar::{
     CASITAR_MAGIC, CasitarError, CasitarFrameHeader, CasitarHeader, MAX_CASITAR_HEADER_BYTES,
