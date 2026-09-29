@@ -527,6 +527,9 @@ struct StaleOnceMetadataStore {
 struct FailingCommitMetadataStore<SS> {
     inner: SS,
     fail_once: Arc<AtomicBool>,
+    /// Apply the commit before reporting the failure: its outcome is unknown
+    /// to the caller although it landed.
+    lands: bool,
 }
 
 #[derive(Clone)]
@@ -991,6 +994,12 @@ impl<SS: MetadataStore> MetadataStore for FailingCommitMetadataStore<SS> {
         mutation: MetadataMutation,
     ) -> Result<CommitResult, MetadataError> {
         if self.fail_once.swap(false, Ordering::SeqCst) {
+            if self.lands {
+                self.inner.commit(expected, mutation).await?;
+                return Err(MetadataError::Backend(
+                    "injected loss of a landed commit's response".to_owned(),
+                ));
+            }
             return Err(MetadataError::Backend(
                 "injected failure before logical commit".to_owned(),
             ));
@@ -3797,6 +3806,7 @@ async fn logical_prune_failure_never_starts_physical_deletion() {
         FailingCommitMetadataStore {
             inner: MemoryMetadataStore::new().unwrap(),
             fail_once: fail_once.clone(),
+            lands: false,
         },
     );
     let mutation = repository.mutation_session().await.unwrap();
@@ -5076,6 +5086,7 @@ async fn reopen_and_fsck_recover_after_publication_commit_failure() {
         FailingCommitMetadataStore {
             inner: base.metadata().clone(),
             fail_once: Arc::new(AtomicBool::new(true)),
+            lands: false,
         },
         FormatRegistry::builtin(),
         FormatLimits::default(),
@@ -5124,6 +5135,122 @@ async fn reopen_and_fsck_recover_after_publication_commit_failure() {
         "collection must remove abandoned uploads"
     );
     assert!(reopened.fsck().await.unwrap().is_clean());
+}
+
+/// A commit whose response is lost may have landed although the caller sees
+/// an error, and publication then aborts its prepared payload catalog. That
+/// happens to a publication commit on either profile, and to the catalog-only
+/// maintenance commit of a remote packed profile (a local profile rebases its
+/// catalog inline). The repository must keep working: after collection, a
+/// later publication, collection and vacuum, every root that landed is intact
+/// and fsck is clean.
+#[tokio::test]
+async fn a_landed_commit_whose_response_is_lost_keeps_every_root() {
+    for (remote, maintenance) in [(false, false), (true, false), (true, true)] {
+        let context = format!("remote {remote}, maintenance commit {maintenance}");
+        let temporary = tempfile::tempdir().unwrap();
+        let objects: Arc<dyn crate::object_store::ObjectStore> =
+            Arc::new(crate::object_store::memory::InMemory::new());
+        let state = crate::TursoMetadataStore::open(temporary.path().join("casita.sqlite"))
+            .await
+            .unwrap();
+        let open_payloads = |catalog: Option<Vec<u8>>| {
+            let (objects, blobs) = (objects.clone(), temporary.path().join("blobs"));
+            async move {
+                if !remote {
+                    std::fs::create_dir_all(&blobs).unwrap();
+                    return ChunkedBlobStore::local_packed(blobs).await.unwrap();
+                }
+                let options = crate::PackOptions {
+                    target_size: u64::MAX,
+                    cache_capacity: 0,
+                };
+                let base = crate::object_store::path::Path::from("remote");
+                match catalog {
+                    Some(catalog) => {
+                        ChunkedBlobStore::packed_with_catalog(
+                            objects, base, 1024, options, &catalog,
+                        )
+                        .await
+                    }
+                    None => {
+                        ChunkedBlobStore::packed_with_options(objects, base, 1024, options).await
+                    }
+                }
+                .unwrap()
+            }
+        };
+        let fail_once = Arc::new(AtomicBool::new(!maintenance));
+        let mut repository = Repository::new(
+            open_payloads(None).await,
+            FailingCommitMetadataStore {
+                inner: state.clone(),
+                fail_once: fail_once.clone(),
+                lands: true,
+            },
+        );
+        if !remote {
+            repository = repository.with_fs_coordination(temporary.path());
+        }
+        let publish = async |repository: &Repository<_, _>, name: &str| {
+            let session = repository.mutation_session().await.unwrap();
+            let object = session.stage_blob(name.as_bytes()).await.unwrap();
+            let key = object.record().key().clone();
+            session
+                .publish_rooted(vec![object], RootName::try_from(name).unwrap(), key)
+                .await
+        };
+        let pause = maintenance.then(|| repository.pause_catalog_maintenance_for_test());
+        assert_eq!(
+            publish(&repository, "first").await.is_err(),
+            !maintenance,
+            "{context}"
+        );
+        if let Some(pause) = pause {
+            repository
+                .payloads()
+                .set_pack_catalog_rebase_run_bytes_for_test(1);
+            publish(&repository, "second").await.unwrap();
+            pause.reached.notified().await;
+            fail_once.store(true, Ordering::SeqCst);
+            pause.resume.notify_one();
+            // The background commit's outcome is unknown, so draining reports it.
+            assert!(crate::flush_repository_leases().await.is_err(), "{context}");
+        }
+        assert!(
+            !fail_once.load(Ordering::SeqCst),
+            "{context}: no commit lost its response"
+        );
+        repository.collect().await.unwrap();
+        publish(&repository, "later").await.unwrap();
+        repository.collect().await.unwrap();
+        repository.vacuum().await.unwrap();
+        drop(repository);
+
+        let catalog = state
+            .snapshot()
+            .await
+            .unwrap()
+            .payload_catalog()
+            .map(<[u8]>::to_vec);
+        let reopened = Repository::new(open_payloads(catalog).await, state);
+        let snapshot = reopened.metadata().snapshot().await.unwrap();
+        let roots: &[&str] = if maintenance {
+            &["first", "second", "later"]
+        } else {
+            &["first", "later"]
+        };
+        for root in roots {
+            let name = RootName::try_from(*root).unwrap();
+            assert!(
+                snapshot.root(&name).await.unwrap().is_some(),
+                "{context}: {root}"
+            );
+        }
+        drop(snapshot);
+        let report = reopened.fsck().await.unwrap();
+        assert!(report.is_clean(), "{context}: {report:?}");
+    }
 }
 
 #[tokio::test]
