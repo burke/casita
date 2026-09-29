@@ -717,8 +717,9 @@ impl AtomicOutput {
             .take()
             .expect("an unpublished Casitar output owns its temporary file");
         file.flush().await?;
-        file.sync_all().await?;
-        drop(file);
+        // Ordered before the name is published; the directory flush below
+        // persists both (see `blob::sync_ordered`).
+        crate::blob::sync_ordered(&file.into_std().await)?;
         match self.policy {
             CasitarExportFilePolicy::CreateNew => {
                 std::fs::hard_link(&self.temporary, &self.destination)?;

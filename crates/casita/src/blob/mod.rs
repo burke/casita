@@ -27,6 +27,7 @@ mod local_durability;
 #[cfg(test)]
 pub(crate) use local_durability::SYNCED_DIRECTORIES;
 pub use local_durability::sync_directory;
+pub(crate) use local_durability::sync_ordered;
 mod memory;
 mod pack;
 mod pack_options;
