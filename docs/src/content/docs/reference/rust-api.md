@@ -91,7 +91,7 @@ These types remain public with `default-features = false`:
 - `Directory`, `Node`, `DirectoryError`, and `DirectoryDecodeError`;
 - `PathComponent`, `PathComponentError`, `SymlinkTarget`, and `SymlinkTargetError`;
 - `NamespaceId`, `ObjectKey`, `ObjectRecord`, `RootName`, `RootRecord`,
-  and `RepositoryRevision`;
+  `RepositoryRevision`, and `RepositoryGeneration`;
 - `NamespaceIdError`, `ObjectKeyError`, `RootNameError`, and
   `RepositoryRevisionError`; and
 - `RetryDisposition`.

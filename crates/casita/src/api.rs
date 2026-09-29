@@ -16,8 +16,8 @@ use crate::repository::{
 };
 use crate::sync::TransferError;
 use crate::{
-    ErrorKind, IntegrityDisposition, IntegrityIssue, ObjectKey, ObjectRecord, RepositoryRevision,
-    RetryDisposition, RootName, RootRecord,
+    ErrorKind, IntegrityDisposition, IntegrityIssue, ObjectKey, ObjectRecord, RepositoryGeneration,
+    RepositoryRevision, RetryDisposition, RootName, RootRecord,
 };
 
 use crate::metadata::{MetadataError, MetadataMutation, MetadataSnapshot};
@@ -60,6 +60,16 @@ impl MetadataReader {
     /// Revision observed by every operation on this reader.
     pub fn revision(&self) -> RepositoryRevision {
         self.snapshot.revision()
+    }
+
+    /// The position of this reader's revision in the repository's commit
+    /// order. Custom backends without generations return
+    /// [`ErrorKind::Unsupported`].
+    pub fn generation(&self) -> Result<RepositoryGeneration, Error> {
+        self.snapshot
+            .generation()
+            .map(RepositoryGeneration::new)
+            .app()
     }
 
     /// Get up to 4096 keys in input order. Duplicates are preserved and missing
@@ -196,6 +206,18 @@ impl RetainedReader {
     /// Revision shared by metadata, root, and content lookups.
     pub fn revision(&self) -> RepositoryRevision {
         self.hold.snapshot().revision()
+    }
+
+    /// The position of this reader's revision in the repository's commit
+    /// order: of two readers of one repository, the one with the larger
+    /// generation sees every commit the other sees. Custom backends without
+    /// generations return [`ErrorKind::Unsupported`].
+    pub fn generation(&self) -> Result<RepositoryGeneration, Error> {
+        self.hold
+            .snapshot()
+            .generation()
+            .map(RepositoryGeneration::new)
+            .app()
     }
 
     /// Read a root whose snapshot content remains protected while this session
@@ -958,6 +980,51 @@ impl Repository {
 mod tests {
     use super::*;
     use crate::{BlobId, Digest, Directory, Node, PathComponent};
+
+    struct NoGenerations;
+
+    #[async_trait::async_trait]
+    impl MetadataSnapshot for NoGenerations {
+        fn revision(&self) -> RepositoryRevision {
+            RepositoryRevision::from_bytes([0; 32])
+        }
+        async fn object(
+            &self,
+            _key: &ObjectKey,
+        ) -> Result<Option<ObjectRecord>, crate::metadata::MetadataError> {
+            Ok(None)
+        }
+        async fn root(
+            &self,
+            _name: &RootName,
+        ) -> Result<Option<ObjectKey>, crate::metadata::MetadataError> {
+            Ok(None)
+        }
+        fn objects(
+            &self,
+        ) -> futures::stream::BoxStream<'static, Result<ObjectRecord, crate::metadata::MetadataError>>
+        {
+            Box::pin(futures::stream::empty())
+        }
+        fn roots(
+            &self,
+        ) -> futures::stream::BoxStream<'static, Result<RootRecord, crate::metadata::MetadataError>>
+        {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    #[test]
+    fn backends_without_generations_report_unsupported() {
+        let reader = MetadataReader {
+            snapshot: Arc::new(NoGenerations),
+            _pin: None,
+        };
+        assert_eq!(
+            reader.generation().unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
+    }
 
     #[tokio::test]
     async fn verified_read_and_overwrite_survive_collection_and_reopen() {

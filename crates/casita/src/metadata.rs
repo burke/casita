@@ -395,9 +395,7 @@ pub trait MetadataSnapshot: Send + Sync {
     /// remain unchanged by idempotent insertion and checkpoint rewrites.
     /// Backends must persist the counter atomically with each successful commit.
     fn generation(&self) -> Result<u64, MetadataError> {
-        Err(MetadataError::Backend(
-            "metadata backend does not support snapshot generations".into(),
-        ))
+        Err(MetadataError::UnsupportedMetadata)
     }
 
     /// Stream current records first inserted at or before `generation`.
@@ -408,9 +406,7 @@ pub trait MetadataSnapshot: Send + Sync {
         _generation: u64,
     ) -> BoxStream<'static, Result<ObjectRecord, MetadataError>> {
         Box::pin(stream::once(async {
-            Err(MetadataError::Backend(
-                "metadata backend does not support snapshot generations".into(),
-            ))
+            Err(MetadataError::UnsupportedMetadata)
         }))
     }
 

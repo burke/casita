@@ -50,7 +50,9 @@ and [Garbage Collection](../garbage-collection/) for those lifetimes.
 ## The locality boundary
 
 A `RepositoryRevision` compares state within one repository. It is not a clock
-or a value to order across replicas. Roots are also local mappings. Sync can
+or a value to order across replicas. A `RepositoryGeneration` orders the states
+one repository's readers observe, and is likewise meaningless across
+repositories. Roots are also local mappings. Sync can
 copy a source root's selected value to a destination, but it does not merge
 concurrent name changes.
 
