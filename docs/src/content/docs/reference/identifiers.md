@@ -103,7 +103,7 @@ commit advances it atomically with the new revision, and it never decreases,
 so of two readers of one repository, the one with the larger generation sees
 every commit the other sees. `MetadataReader::generation` and
 `RetainedReader::generation` report it; custom metadata backends without
-generations return an error. It is displayed as:
+generations return an `Unsupported` error. It is displayed as:
 
 ```text
 gen-<decimal generation>

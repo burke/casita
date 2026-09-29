@@ -63,7 +63,8 @@ impl MetadataReader {
     }
 
     /// The position of this reader's revision in the repository's commit
-    /// order. Fails only on custom backends without generations.
+    /// order. Custom backends without generations return
+    /// [`ErrorKind::Unsupported`].
     pub fn generation(&self) -> Result<RepositoryGeneration, Error> {
         self.snapshot
             .generation()
@@ -209,8 +210,8 @@ impl RetainedReader {
 
     /// The position of this reader's revision in the repository's commit
     /// order: of two readers of one repository, the one with the larger
-    /// generation sees every commit the other sees. Fails only on custom
-    /// backends without generations.
+    /// generation sees every commit the other sees. Custom backends without
+    /// generations return [`ErrorKind::Unsupported`].
     pub fn generation(&self) -> Result<RepositoryGeneration, Error> {
         self.hold
             .snapshot()
@@ -979,6 +980,51 @@ impl Repository {
 mod tests {
     use super::*;
     use crate::{BlobId, Digest, Directory, Node, PathComponent};
+
+    struct NoGenerations;
+
+    #[async_trait::async_trait]
+    impl MetadataSnapshot for NoGenerations {
+        fn revision(&self) -> RepositoryRevision {
+            RepositoryRevision::from_bytes([0; 32])
+        }
+        async fn object(
+            &self,
+            _key: &ObjectKey,
+        ) -> Result<Option<ObjectRecord>, crate::metadata::MetadataError> {
+            Ok(None)
+        }
+        async fn root(
+            &self,
+            _name: &RootName,
+        ) -> Result<Option<ObjectKey>, crate::metadata::MetadataError> {
+            Ok(None)
+        }
+        fn objects(
+            &self,
+        ) -> futures::stream::BoxStream<'static, Result<ObjectRecord, crate::metadata::MetadataError>>
+        {
+            Box::pin(futures::stream::empty())
+        }
+        fn roots(
+            &self,
+        ) -> futures::stream::BoxStream<'static, Result<RootRecord, crate::metadata::MetadataError>>
+        {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    #[test]
+    fn backends_without_generations_report_unsupported() {
+        let reader = MetadataReader {
+            snapshot: Arc::new(NoGenerations),
+            _pin: None,
+        };
+        assert_eq!(
+            reader.generation().unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
+    }
 
     #[tokio::test]
     async fn verified_read_and_overwrite_survive_collection_and_reopen() {
