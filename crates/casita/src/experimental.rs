@@ -86,8 +86,8 @@ pub use crate::linked::{
 pub use crate::node::Node;
 pub use crate::object::{
     BLOB_NAMESPACE, DIRECTORY_NAMESPACE, LogicalEncodingError, NamespaceId, NamespaceIdError,
-    ObjectKey, ObjectKeyError, ObjectRecord, ObjectRecordError, RepositoryRevision,
-    RepositoryRevisionError, RootName, RootNameError, RootRecord,
+    ObjectKey, ObjectKeyError, ObjectRecord, ObjectRecordError, RepositoryGeneration,
+    RepositoryRevision, RepositoryRevisionError, RootName, RootNameError, RootRecord,
 };
 #[cfg(feature = "native")]
 pub use crate::repository::RootRetention;

@@ -96,6 +96,22 @@ A successful logical mutation creates a fresh revision. Revisions support
 equality checks only: they do not expose ordering and do not identify a state
 in another repository.
 
+## Repository generations
+
+`RepositoryGeneration` orders the states of one repository. Every successful
+commit advances it atomically with the new revision, and it never decreases,
+so of two readers of one repository, the one with the larger generation sees
+every commit the other sees. `MetadataReader::generation` and
+`RetainedReader::generation` report it; custom metadata backends without
+generations return an error. It is displayed as:
+
+```text
+gen-<decimal generation>
+```
+
+Generations of different repositories, or of a repository recreated at the
+same location, are unrelated.
+
 ## Filesystem names
 
 `PathComponent` stores a raw byte name between 1 and 255 bytes. It rejects

@@ -100,6 +100,7 @@ or encoding methods to the supported record types.
 | `ObjectRecord` | Immutable key, BLAKE3 payload ID, payload length, and canonical forward links |
 | `RootName` / `RootRecord` | Durable name selecting one exact object and retaining its complete closure |
 | `RepositoryRevision` | Opaque token for one logical state; compare for equality only |
+| `RepositoryGeneration` | Position of a logical state in its repository's commit order; ordered within one repository |
 | `ClosureStatus` | `Complete`, `Missing`, `Invalid`, or `Unsupported` result for one snapshot traversal |
 | `Digest`, `BlobId`, `DirectoryId`, `ChunkId` | Raw and capability-typed BLAKE3 identities |
 | `Directory`, `Node`, `PathComponent`, `SymlinkTarget` | Canonical filesystem data model |

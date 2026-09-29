@@ -16,8 +16,8 @@ use crate::repository::{
 };
 use crate::sync::TransferError;
 use crate::{
-    ErrorKind, IntegrityDisposition, IntegrityIssue, ObjectKey, ObjectRecord, RepositoryRevision,
-    RetryDisposition, RootName, RootRecord,
+    ErrorKind, IntegrityDisposition, IntegrityIssue, ObjectKey, ObjectRecord, RepositoryGeneration,
+    RepositoryRevision, RetryDisposition, RootName, RootRecord,
 };
 
 use crate::metadata::{MetadataError, MetadataMutation, MetadataSnapshot};
@@ -60,6 +60,15 @@ impl MetadataReader {
     /// Revision observed by every operation on this reader.
     pub fn revision(&self) -> RepositoryRevision {
         self.snapshot.revision()
+    }
+
+    /// The position of this reader's revision in the repository's commit
+    /// order. Fails only on custom backends without generations.
+    pub fn generation(&self) -> Result<RepositoryGeneration, Error> {
+        self.snapshot
+            .generation()
+            .map(RepositoryGeneration::new)
+            .app()
     }
 
     /// Get up to 4096 keys in input order. Duplicates are preserved and missing
@@ -196,6 +205,18 @@ impl RetainedReader {
     /// Revision shared by metadata, root, and content lookups.
     pub fn revision(&self) -> RepositoryRevision {
         self.hold.snapshot().revision()
+    }
+
+    /// The position of this reader's revision in the repository's commit
+    /// order: of two readers of one repository, the one with the larger
+    /// generation sees every commit the other sees. Fails only on custom
+    /// backends without generations.
+    pub fn generation(&self) -> Result<RepositoryGeneration, Error> {
+        self.hold
+            .snapshot()
+            .generation()
+            .map(RepositoryGeneration::new)
+            .app()
     }
 
     /// Read a root whose snapshot content remains protected while this session

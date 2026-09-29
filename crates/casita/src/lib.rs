@@ -221,8 +221,8 @@ pub use encode::DirectoryDecodeError;
 pub use error::{DirectoryError, RetryDisposition};
 pub use node::Node;
 pub use object::{
-    NamespaceId, NamespaceIdError, ObjectKey, ObjectKeyError, ObjectRecord, RepositoryRevision,
-    RepositoryRevisionError, RootName, RootNameError, RootRecord,
+    NamespaceId, NamespaceIdError, ObjectKey, ObjectKeyError, ObjectRecord, RepositoryGeneration,
+    RepositoryRevision, RepositoryRevisionError, RootName, RootNameError, RootRecord,
 };
 pub use path::{PathComponent, PathComponentError, SymlinkTarget, SymlinkTargetError};
 

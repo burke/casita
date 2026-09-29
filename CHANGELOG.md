@@ -13,6 +13,11 @@ and will use [Semantic Versioning](https://semver.org/) for tagged releases.
 
 ### Added
 
+- `RepositoryGeneration` orders the logical states of one repository.
+  `MetadataReader::generation` and `RetainedReader::generation` report a
+  reader's position in the commit order, so an application holding several
+  readers can tell which one observes the newest state without comparing
+  their unordered `RepositoryRevision`s.
 - `experimental::RepositoryProfile` groups a repository's deployment policy
   (cross-process coordination, spill placement and limits, emergency
   collection, the import cache and disk-pressure maintenance) in one value.

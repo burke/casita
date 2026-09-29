@@ -593,6 +593,36 @@ impl FromStr for RepositoryRevision {
     }
 }
 
+/// The position of a logical repository state in its repository's commit
+/// order.
+///
+/// [`RepositoryRevision`] identifies a state but is deliberately random and
+/// unordered. The generation orders states: every successful commit of a
+/// repository advances it, atomically with the new revision, and it never
+/// decreases. Of two states of one repository, the one with the larger
+/// generation includes every commit of the other, and equal generations
+/// denote the same state. Generations of different repositories, or of a
+/// repository recreated at the same location, are unrelated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RepositoryGeneration(u64);
+
+impl RepositoryGeneration {
+    pub(crate) const fn new(generation: u64) -> Self {
+        Self(generation)
+    }
+
+    /// The generation as a number.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for RepositoryGeneration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "gen-{}", self.0)
+    }
+}
+
 /// Errors decoding the frozen logical key and root layouts.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum LogicalEncodingError {
