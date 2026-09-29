@@ -119,11 +119,11 @@ Every commit syncs the WAL before it is acknowledged (`synchronous = FULL`).
 On Linux and Windows that sync reaches stable storage. On macOS it reaches the
 drive's volatile cache, so a power loss may discard the most recent
 acknowledged commits. Deletions that a commit allows (collection sweeps and
-catalog reclamation) first flush the drive cache (`F_FULLFSYNC`) whenever the
-database changed since the last flush, so a power loss cannot keep those
-deletions while losing the commit behind them: the repository reopens
-consistent, at an earlier revision. That costs one flush per collection pass
-rather than one per commit.
+catalog reclamation) first flush the drive cache (`F_FULLFSYNC`), so a power
+loss cannot keep those deletions while losing the commit behind them. The
+repository reopens consistent, at an earlier revision. Casita flushes before
+every deletion batch, rather than on every commit. WAL size and modification
+time cannot identify commits that finished syncing after an earlier flush.
 
 ## Physical payload behavior
 

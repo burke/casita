@@ -5,10 +5,9 @@ use super::*;
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-/// A collection pass that deletes pays for making the prune commit durable
-/// once, however many payloads it deletes; a pass with nothing to delete pays
-/// nothing. Garbage counts span a single payload to many delete batches, so a
-/// flush per batch would show up as a count that grows with the garbage.
+/// A collection pass flushes before every deletion batch; a pass with nothing
+/// to delete pays nothing. Garbage counts span a single payload to many
+/// deletion batches, so the probe reports how flush cost grows with garbage.
 /// Fixture construction is outside timing.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -24,9 +23,9 @@ async fn benchmark_collection_deletion_ordering() {
         .map(|v| v.parse().unwrap())
         .collect();
     assert!(iterations > 0 && !counts.is_empty());
-    let mut flushes_per_pass = BTreeSet::new();
     for &count in &counts {
         let (mut deleting, mut idle) = (0_u128, 0_u128);
+        let mut flushes_per_pass = BTreeSet::new();
         for iteration in 0..iterations {
             let directory = tempfile::tempdir().unwrap();
             let repository = Repository::local(directory.path()).await.unwrap();
@@ -89,15 +88,15 @@ async fn benchmark_collection_deletion_ordering() {
             "deletion_ordering_objects_{count}_idle_collect_nanos {}",
             idle / iterations as u128
         );
+        assert_eq!(
+            flushes_per_pass.len(),
+            1,
+            "flush count varied across identical passes: {flushes_per_pass:?}"
+        );
+        println!(
+            "deletion_ordering_objects_{count}_flushes_per_pass {}",
+            flushes_per_pass.first().unwrap()
+        );
     }
-    assert_eq!(
-        flushes_per_pass.len(),
-        1,
-        "flushes per pass grew with the garbage: {flushes_per_pass:?}"
-    );
-    println!(
-        "deletion_ordering_flushes_per_pass {}",
-        flushes_per_pass.first().unwrap()
-    );
     println!("deletion_ordering_iterations {iterations}");
 }

@@ -82,7 +82,7 @@ pub struct TursoMetadataStore {
     db: Arc<TursoDb>,
     validated: ValidationCounter,
     pins: Arc<std::sync::OnceLock<Arc<super::FilePinStore>>>,
-    /// Shared by clones so their deletions coalesce on one flush.
+    /// Shared by clones so each deletion batch reaches the same database.
     commits: Option<crate::blob::CommitDurability>,
 }
 

@@ -179,8 +179,8 @@ async fn benchmark_state_publication() {
 /// What a drive-cache flush per commit would cost: Turso commit latency with
 /// the production sync (`fsync`) and with `PRAGMA fullfsync` (`full`,
 /// `F_FULLFSYNC` on Apple platforms, the only ones where the modes differ),
-/// from empty commits to batches that amortize the flush. Casita flushes once
-/// before deletions instead (`blob::deletion_barrier`). A reopened inventory
+/// from empty commits to batches that amortize the flush. Casita flushes before
+/// each deletion batch instead (`blob::deletion_barrier`). A reopened inventory
 /// audit gates each mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "performance probe; run through benchmark run metadata-durability"]

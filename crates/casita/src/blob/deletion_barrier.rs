@@ -12,39 +12,21 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// How to make a metadata store's acknowledged commits durable: flush the
 /// drive cache holding its database (`F_FULLFSYNC`, which `File::sync_all`
-/// issues on Apple platforms) unless the database files are unchanged since
-/// the last flush, so a collection pass pays one flush, not one per deletion.
+/// issues on Apple platforms) before each deletion batch. A WAL writer can
+/// finish its commit sync without changing file size or mtime, so file stamps
+/// cannot prove that a previous flush covered an acknowledged commit.
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct CommitDurability(Arc<Database>);
 
 #[derive(Debug)]
 struct Database {
-    files: [PathBuf; 2],
     directory: PathBuf,
-    /// Held across a flush, so concurrent deletion batches share one.
-    flushed: Mutex<Option<Stamp>>,
     #[cfg(test)]
     flushes: std::sync::atomic::AtomicUsize,
-}
-
-/// Length and modification time of the database and its WAL. Any commit or
-/// checkpoint writes one of them, so an unchanged stamp means nothing was
-/// committed since it was taken.
-type Stamp = [Option<(u64, SystemTime)>; 2];
-
-/// A filesystem with whole-second timestamps can hide two writes behind one
-/// stamp, so only a stamp with sub-second precision may skip a flush.
-fn is_precise(stamp: &Stamp) -> bool {
-    stamp.iter().flatten().all(|(_, modified)| {
-        modified
-            .duration_since(UNIX_EPOCH)
-            .is_ok_and(|elapsed| elapsed.subsec_nanos() != 0)
-    })
 }
 
 impl CommitDurability {
@@ -56,16 +38,12 @@ impl CommitDurability {
     }
 
     fn new(database: &Path) -> Self {
-        let mut wal = database.as_os_str().to_owned();
-        wal.push("-wal");
         let directory = match database.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
             _ => PathBuf::from("."),
         };
         Self(Arc::new(Database {
-            files: [database.to_path_buf(), PathBuf::from(wal)],
             directory,
-            flushed: Mutex::default(),
             #[cfg(test)]
             flushes: Default::default(),
         }))
@@ -87,23 +65,10 @@ impl CommitDurability {
 
 impl Database {
     fn ensure(&self) -> io::Result<()> {
-        let mut flushed = self.flushed.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut stamp = [None, None];
-        for (slot, path) in stamp.iter_mut().zip(&self.files) {
-            *slot = match std::fs::metadata(path) {
-                Ok(metadata) => Some((metadata.len(), metadata.modified()?)),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error),
-            };
-        }
-        if is_precise(&stamp) && *flushed == Some(stamp) {
-            return Ok(());
-        }
         // Opening the directory, not the database, leaves the engine's
         // process-scoped file locks alone: closing any descriptor of a locked
         // file would release them.
         File::open(&self.directory)?.sync_all()?;
-        *flushed = Some(stamp);
         tracing::debug!("flushed committed state before deleting payloads");
         #[cfg(test)]
         self.flushes
@@ -158,7 +123,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn flushes_once_after_each_commit_that_precedes_a_deletion() {
+    async fn flushes_before_each_deletion_batch() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("casita.sqlite");
         let db = crate::sqlite::TursoDb::open(&path).unwrap();
@@ -168,14 +133,14 @@ mod tests {
 
         barrier.before_deletion().await.unwrap();
         barrier.before_deletion().await.unwrap();
-        assert_eq!(commits.flushes(), 1, "no commit since the last flush");
+        assert_eq!(commits.flushes(), 2, "each batch requires a flush");
         commit(&db).await;
         barrier.before_deletion().await.unwrap();
-        assert_eq!(commits.flushes(), 2, "a commit since the last flush");
+        assert_eq!(commits.flushes(), 3, "a commit since the last flush");
         // A second handle stands in for another process's commit.
         commit(&crate::sqlite::TursoDb::open(&path).unwrap()).await;
         barrier.before_deletion().await.unwrap();
-        assert_eq!(commits.flushes(), 3, "another writer's commit");
+        assert_eq!(commits.flushes(), 4, "another writer's commit");
     }
 
     #[tokio::test]
@@ -194,12 +159,27 @@ mod tests {
         assert_eq!((first.flushes(), second.flushes()), (1, 1));
     }
 
-    #[test]
-    fn whole_second_timestamps_never_skip_a_flush() {
-        let whole = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let precise = whole + std::time::Duration::from_nanos(1);
-        assert!(!is_precise(&[Some((4096, whole)), None]));
-        assert!(is_precise(&[Some((4096, precise)), None]));
-        assert!(!is_precise(&[Some((4096, precise)), Some((0, whole))]));
+    #[tokio::test]
+    async fn wal_sync_after_flush_does_not_make_the_next_flush_optional() {
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("casita.sqlite");
+        let mut wal = File::create(directory.path().join("casita.sqlite-wal")).unwrap();
+        wal.write_all(b"pending commit").unwrap();
+        let before = wal.metadata().unwrap();
+        let commits = CommitDurability::new(&path);
+        let barrier = DeletionBarrier::default();
+        barrier.order_after(commits.clone());
+
+        // A concurrent writer may have written its last WAL frame but not
+        // finished syncing it when the deletion barrier runs.
+        barrier.before_deletion().await.unwrap();
+        wal.sync_all().unwrap();
+        let after = wal.metadata().unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        barrier.before_deletion().await.unwrap();
+        assert_eq!(commits.flushes(), 2);
     }
 }
