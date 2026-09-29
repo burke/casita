@@ -252,6 +252,35 @@ impl LocalDurability {
             .await
     }
 
+    /// Publish an immutable object that a later commit names, such as a pack.
+    ///
+    /// Issues the syncs of `LocalFileSystem`'s fsync'd put: each new directory,
+    /// the file before its rename, and the parent after it. They use
+    /// [`sync_ordered`], so on Apple platforms the object reaches storage
+    /// before any later write, including the commit that names it, without
+    /// waiting for the drive: a power loss can lose it only together with
+    /// that commit. Elsewhere this is exactly the fsync'd put.
+    #[tracing::instrument(
+        name = "blob.local_durability.put_ordered",
+        level = "debug",
+        skip_all,
+        fields(bytes = bytes.len())
+    )]
+    pub(crate) async fn put_ordered(&self, location: &Path, bytes: Bytes) -> io::Result<()> {
+        let destination = self
+            .filesystem
+            .path_to_filesystem(location)
+            .map_err(io::Error::other)?;
+        self.pins
+            .capture()
+            .write(pin_path(location), async move {
+                tokio::task::spawn_blocking(move || ordered_put(&destination, &bytes))
+                    .await
+                    .map_err(io::Error::other)?
+            })
+            .await
+    }
+
     #[tracing::instrument(
         name = "blob.local_durability.prepare",
         level = "debug",
@@ -402,6 +431,65 @@ fn prepare_put(destination: PathBuf, bytes: &[u8]) -> io::Result<PreparedLocalPu
         destination,
         pins: Default::default(),
     })
+}
+
+fn ordered_put(destination: &FsPath, bytes: &[u8]) -> io::Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::other("durable object path has no parent"))?;
+    create_ordered_directories(parent)?;
+    let (temporary, mut file) = create_temporary(destination)?;
+    let written = file.write_all(bytes).and_then(|()| sync_ordered(&file));
+    drop(file);
+    if let Err(error) = written.and_then(|()| std::fs::rename(&temporary, destination)) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    sync_directory_ordered(parent)
+}
+
+/// Create `directory` and its missing ancestors, then sync each new directory
+/// and the existing ancestor that gained an entry, deepest first.
+fn create_ordered_directories(directory: &FsPath) -> io::Result<()> {
+    if directory.is_dir() {
+        return Ok(());
+    }
+    let mut existing = directory;
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .ok_or_else(|| io::Error::other("durable object path has no existing ancestor"))?;
+    }
+    std::fs::create_dir_all(directory)?;
+    let mut current = directory;
+    loop {
+        sync_directory_ordered(current)?;
+        if current == existing {
+            return Ok(());
+        }
+        current = current
+            .parent()
+            .ok_or_else(|| io::Error::other("durable object path has no parent"))?;
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory_ordered(directory: &FsPath) -> io::Result<()> {
+    sync_ordered(&File::open(directory)?)?;
+    #[cfg(test)]
+    SYNCED_DIRECTORIES.with_borrow_mut(|record| {
+        if let Some(paths) = record {
+            paths.push(directory.to_path_buf());
+        }
+    });
+    Ok(())
+}
+
+/// Directories cannot be opened for syncing on other platforms, as in
+/// `sync_directory_chains`.
+#[cfg(not(unix))]
+fn sync_directory_ordered(_directory: &FsPath) -> io::Result<()> {
+    Ok(())
 }
 
 fn pin_path(location: &Path) -> std::collections::BTreeSet<crate::metadata::PinResource> {
@@ -635,6 +723,37 @@ mod tests {
         assert_eq!(synced, chain);
         assert_eq!(PERSISTED_DIRECTORIES.take(), [root.to_path_buf()]);
         assert_eq!(std::fs::read(&object).unwrap(), b"catalog shard");
+    }
+
+    /// An ordered put syncs what a later commit relies on to find the object:
+    /// each directory it created and the existing ancestor that gained an
+    /// entry, then the parent after the rename. Later puts into that directory
+    /// sync only the parent. None of these waits for the drive.
+    #[cfg(unix)]
+    #[test]
+    fn ordered_puts_sync_new_directories_once_and_the_parent_after_each_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let shard = root.join("packs/ab/cd");
+        SYNCED_DIRECTORIES.with_borrow_mut(|record| *record = Some(Vec::new()));
+        PERSISTED_DIRECTORIES.with_borrow_mut(Vec::clear);
+        ordered_put(&shard.join("first"), b"first").unwrap();
+        let created = ["packs/ab/cd", "packs/ab", "packs"].map(|path| root.join(path));
+        let mut expected = created.to_vec();
+        expected.extend([root.to_path_buf(), shard.clone()]);
+        let synced = SYNCED_DIRECTORIES.with_borrow_mut(|record| record.replace(Vec::new()));
+        assert_eq!(synced.unwrap(), expected);
+
+        ordered_put(&shard.join("second"), b"second").unwrap();
+        let synced = SYNCED_DIRECTORIES.with_borrow_mut(|record| record.take().unwrap());
+        assert_eq!(synced, std::slice::from_ref(&shard));
+        assert!(PERSISTED_DIRECTORIES.take().is_empty());
+        assert_eq!(std::fs::read(shard.join("first")).unwrap(), b"first");
+        assert_eq!(
+            std::fs::read_dir(&shard).unwrap().count(),
+            2,
+            "no staging files remain"
+        );
     }
 
     #[tokio::test]

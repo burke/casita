@@ -3136,6 +3136,24 @@ impl PackedChunks {
         Ok(())
     }
 
+    /// Write an immutable pack or tombstone delta that a later catalog or
+    /// metadata commit names. A local repository orders it before that commit
+    /// rather than waiting for the drive (see
+    /// [`LocalDurability::put_ordered`]); every other store takes a plain PUT.
+    async fn put_pack_object(&self, path: &Path, bytes: Bytes) -> io::Result<()> {
+        let Some(local) = &self.local_durability else {
+            return put_object(&self.object_store, path, bytes, true)
+                .await
+                .map_err(io::Error::other);
+        };
+        #[cfg(test)]
+        super::crash_tests::object_checkpoint("before-put", path);
+        local.put_ordered(path, bytes).await?;
+        #[cfg(test)]
+        super::crash_tests::object_checkpoint("after-put", path);
+        Ok(())
+    }
+
     async fn flush_locked(&self) -> io::Result<()> {
         self.flush_sidecars().await?;
         let batch = {
@@ -3152,15 +3170,10 @@ impl PackedChunks {
             batch
         };
         let result = match seal(&batch) {
-            Ok(sealed) => put_object(
-                &self.object_store,
-                &pack_path(&self.base, &sealed.id),
-                sealed.bytes.clone(),
-                true,
-            )
-            .await
-            .map_err(io::Error::other)
-            .map(|()| sealed),
+            Ok(sealed) => self
+                .put_pack_object(&pack_path(&self.base, &sealed.id), sealed.bytes.clone())
+                .await
+                .map(|()| sealed),
             Err(error) => Err(error),
         };
         drop(batch);
@@ -3479,10 +3492,10 @@ impl PackedChunks {
             self.read_counters
                 .gc_tombstone_put_bytes
                 .fetch_add(delta.len() as u64, Ordering::Relaxed);
-            if let Err(error) = put_object(&self.object_store, &delta_path, delta, true).await {
+            if let Err(error) = self.put_pack_object(&delta_path, delta).await {
                 let mut retry = self.dirty_packs.lock().await;
                 retry.extend(deferred.iter().map(|deferred| deferred.tombstone.pack));
-                first_error.get_or_insert_with(|| io::Error::other(error));
+                first_error.get_or_insert(error);
             } else {
                 {
                     let mut index = self.index.write().unwrap();
@@ -6166,14 +6179,8 @@ impl PackedChunks {
             self.read_counters
                 .gc_replacement_put_bytes
                 .fetch_add(pack_len, Ordering::Relaxed);
-            put_object(
-                &self.object_store,
-                &pack_path(&self.base, &sealed.id),
-                sealed.bytes,
-                true,
-            )
-            .await
-            .map_err(io::Error::other)?;
+            self.put_pack_object(&pack_path(&self.base, &sealed.id), sealed.bytes)
+                .await?;
             Some((sealed.id, pack_len, sealed.entries))
         };
         let marker_write = CollectionPhase::new("compact_pack_marker_write");

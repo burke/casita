@@ -108,6 +108,12 @@ and will use [Semantic Versioning](https://semver.org/) for tagged releases.
   4×, collections that delete payloads about 1.5×, and pin-ledger slot
   exchanges 2×. Filesystems without barriers keep the full flush on every
   sync; Linux and Windows are unchanged.
+- On macOS, local repositories write packs and collection tombstones with I/O
+  barriers instead of drive-cache flushes. A pack only needs to reach storage
+  before the commit that names it, which the barrier guarantees, so a power
+  loss can lose it only together with that commit. Cold imports of large files
+  run about 1.2× faster, edited imports 1.1–1.2×, and collections 1.2–1.6×.
+  Catalog rebases no longer sync their scratch merge inputs on any platform.
 - `casita archive create`, `experimental::Repository::export_casitar_file` and
   `export_casitar_file_with_policy`, and `casita init` sync the directory that
   receives their file before reporting success. They already synced the file,

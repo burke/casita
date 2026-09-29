@@ -371,10 +371,13 @@ pub(super) fn stage_file(
     })
 }
 
+/// Stage `bytes` as a scratch merge input. The file lives in the temporary
+/// directory only until the merge reads it back, so it is never synced: a crash
+/// discards it anyway, and the merged run is published through
+/// `LocalDurability` or the object store.
 pub(super) fn stage_bytes(bytes: &[u8], reference: CatalogRunRef) -> io::Result<StagedCatalogRun> {
     let mut file = NamedTempFile::new()?;
     file.write_all(bytes)?;
-    file.as_file_mut().sync_data()?;
     stage_file(file, reference)
 }
 
