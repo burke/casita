@@ -586,7 +586,9 @@ where
     }
 }
 
-async fn contains_pax_gnu_sparse<R>(entry: &mut tokio_tar::Entry<R>) -> Result<bool, TarImportError>
+pub(crate) async fn contains_pax_gnu_sparse<R>(
+    entry: &mut tokio_tar::Entry<R>,
+) -> Result<bool, TarImportError>
 where
     R: AsyncRead + Unpin,
 {

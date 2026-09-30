@@ -83,7 +83,7 @@ root demo
         <div class="section-heading centered narrow">
           <span class="section-kicker">Bring your data in</span>
           <h2 id="importers-title">Choose an importer.</h2>
-          <p>Files, archives, NAR inputs, Git history, and application data all enter through the same verified repository API.</p>
+          <p>Files, archives, NAR inputs, Git history, and OCI images all enter through the same verified repository API. <a class="concept-link" href="/guides/adding-an-importer/">Build your own importer</a>.</p>
         </div>
 
         <div class="importer-grid">
@@ -96,6 +96,11 @@ root demo
             <h3>Tar</h3>
             <p>Stream a tar archive into a filesystem graph without extracting it first.</p>
             <span>Tar guide <span aria-hidden="true">→</span></span>
+          </a>
+          <a class="importer-card csk-interactive-surface" href="/guides/oci/">
+            <h3>OCI images <small>oci feature</small></h3>
+            <p>Stream registry layers into a verified image layout and, optionally, a merged filesystem.</p>
+            <span>OCI guide <span aria-hidden="true">→</span></span>
           </a>
           <a class="importer-card csk-interactive-surface" href="/integrations/ipc/#nar-and-filesystem-nar">
             <h3>NAR <small>Rust API · IPC</small></h3>
@@ -111,11 +116,6 @@ root demo
             <h3>Git <small>git feature</small></h3>
             <p>Keep native Git object IDs while importing local branches and tags.</p>
             <span>Git guide <span aria-hidden="true">→</span></span>
-          </a>
-          <a class="importer-card csk-interactive-surface" href="/guides/adding-an-importer/">
-            <h3>Add your own importer</h3>
-            <p>Implement the <code>Importer</code> trait for a new source and publish through the same repository workflow.</p>
-            <span>Read the guide <span aria-hidden="true">→</span></span>
           </a>
         </div>
       </div>
