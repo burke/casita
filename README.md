@@ -28,8 +28,9 @@ Runs on Linux, macOS, and Windows.
 - **Synchronization:** copy graphs between local repositories or from SSH
   sources, with independent verification at the destination. An experimental
   S3 profile supports shared repositories across runners.
-- **Import and export:** import filesystem trees and native Git objects,
-  restore files, and exchange graphs through portable Casitar archives.
+- **Import and export:** import filesystem trees, native Git objects, and OCI images
+  (with `oci`) as layouts and optional merged filesystems. Restore files and
+  exchange graphs through portable Casitar archives.
 - **Rust library:** embed the repository in an application, with experimental
   APIs for custom object formats and storage backends.
 

@@ -14,6 +14,7 @@ profile and optional frontends.
 | `experimental` | — | Public `casita::experimental` namespace for backend, format, tuning, and protocol APIs |
 | `cli` | `native`, `experimental` | The `casita` command-line binary, including the local JSON-RPC/NDJSON service (`casita ipc`) |
 | `git` | `native` | Import from a local working tree or bare Git repository through `gix` |
+| `oci` | `native` | Stream registry images into OCI image layouts and optional merged filesystems through `oci-client` |
 | `git-fetch` | `native` | Experimental read-only Git fetch planning and pack generation |
 | `git-http` | `git`, `git-fetch` | Read-only Git smart-HTTP serving and Tokio networking |
 | `ssh` | `native` | Authenticated transfer sources through the system OpenSSH client |
@@ -58,6 +59,14 @@ casita = {
   features = ["git"],
 }
 
+# OCI registry image import.
+casita = {
+  git = "https://github.com/cachix/casita",
+  branch = "main",
+  default-features = false,
+  features = ["oci"],
+}
+
 # Shared S3 storage through the application API; the storage profile is experimental.
 casita = {
   git = "https://github.com/cachix/casita",
@@ -93,6 +102,7 @@ Install CLI combinations from a source checkout with:
 $ cargo install --path crates/casita
 $ cargo install --path crates/casita --features ssh
 $ cargo install --path crates/casita --features git
+$ cargo install --path crates/casita --features oci
 $ cargo install --path crates/casita --features git-http
 ```
 

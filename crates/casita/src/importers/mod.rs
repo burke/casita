@@ -73,6 +73,8 @@ mod filesystem;
 #[cfg(feature = "git")]
 mod git;
 mod nar;
+#[cfg(feature = "oci")]
+mod oci;
 mod tar;
 
 pub use blob::BlobImport;
@@ -84,4 +86,6 @@ pub use filesystem::{MultiRootFilesystemImport, UnrootedFilesystemImport};
 #[cfg(feature = "git")]
 pub use git::GitImport;
 pub use nar::{FilesystemNarImport, NarImport};
+#[cfg(feature = "oci")]
+pub use oci::OciImport;
 pub use tar::TarImport;
