@@ -98,12 +98,15 @@ casita [--repository PATH] import -i oci IMAGE --root NAME \
 
 Requires the `oci` Cargo feature. The importer selects one platform's manifest
 and downloads its config and compressed layer blobs into a standard OCI image
-layout root. Layer blobs stream into storage. It uses anonymous registry access
+layout. Layer blobs stream into storage. It uses anonymous registry access
 and HTTPS by default.
-`--oci-rootfs-root` also publishes a merged canonical filesystem root for
-checkout or mounting, applying layer whiteouts and verifying uncompressed
-DiffIDs. Both roots move atomically. The filesystem bounds limit decoded tar
-bytes and entries; the blob bounds limit the original compressed downloads.
+
+`--root` names the OCI image layout, including its original layer archives.
+`--oci-rootfs-root` optionally names the merged container root filesystem,
+which can be checked out or mounted. The names must differ. Casita applies
+layer whiteouts and verifies uncompressed DiffIDs before publishing both
+roots atomically. The filesystem bounds limit decoded tar bytes and entries;
+the blob bounds limit the original compressed downloads.
 See [Import an OCI Image](../../guides/oci/) for the output and limits.
 
 The importer prints the directory key and does not follow symlinks. It may

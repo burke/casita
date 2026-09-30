@@ -413,8 +413,9 @@ pub(super) struct ImportArgs {
     /// Importer to run. When omitted, Casita detects the input type.
     #[arg(short = 'i', long, value_enum)]
     pub(super) importer: Option<ImporterKind>,
-    /// Workspace-local name to register the root under. Defaults to the
-    /// canonicalized source path below `auto/`.
+    /// Root name for filesystem, tar, or OCI imports. For OCI, names the image
+    /// layout. Filesystem imports default to the canonicalized source path
+    /// below `auto/`.
     #[arg(long = "root")]
     pub(super) name: Option<String>,
     /// Retention policy for the imported root. Existing policy is kept when omitted.
@@ -447,7 +448,8 @@ pub(super) struct ImportArgs {
 #[cfg(feature = "oci")]
 #[derive(Args)]
 pub(super) struct OciImportArgs {
-    /// Also publish the merged filesystem under this distinct root name.
+    /// Also publish the merged container root filesystem under this name.
+    /// Must differ from --root, which names the OCI image layout.
     #[arg(long = "oci-rootfs-root", value_name = "NAME")]
     pub(super) rootfs_root: Option<String>,
     /// Maximum decoded tar bytes across all layers of a merged filesystem.
