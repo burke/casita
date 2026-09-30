@@ -25,14 +25,19 @@ use super::wal3_shard::{
     encode_root_shard, encode_state_shard_map,
 };
 use super::{
-    CommitResult, MetadataError, MetadataMutation, MetadataSnapshot, MetadataStore, RETAINED_PAGE,
-    RetainedObjects, RootChange, fresh_revision,
+    AddedObject, CollectedObjects, CommitChange, CommitResult, CommitState, MetadataError,
+    MetadataMutation, MetadataSnapshot, MetadataStore, ObjectChange, RETAINED_PAGE,
+    RetainedObjects, RootChange, fresh_revision, validate_commit_transition,
 };
+use crate::invariant::{self, Violation};
 use crate::object::{ObjectKey, ObjectRecord, RepositoryRevision, RootName, RootRecord};
 
 #[cfg(test)]
 #[path = "wal3/experiments.rs"]
 mod experiments;
+#[cfg(test)]
+#[path = "wal3/transition_tests.rs"]
+mod transition_tests;
 
 mod coordination;
 pub use coordination::Wal3RepositoryHold;
@@ -568,6 +573,7 @@ impl Wal3MetadataStore {
                 MetadataError::Corruption("initialized wal3 log has no state record".to_owned())
             })?;
             let compacted = compact_state_objects(&self.object_shards, state).await?;
+            invariant::check(|| validate_compaction("wal3.gc_fence", state, &compacted))?;
             let record = encode_state(&compacted)?;
             match self
                 .writer
@@ -1230,6 +1236,186 @@ impl StateData {
     }
 }
 
+/// Folding the overlay into shards changes representation only. A reader of
+/// the checkpoint rebuilds object, validation and root totals from the shard
+/// map alone, so the fold must carry every object, mark and root.
+fn validate_compaction(
+    point: &'static str,
+    before: &StateData,
+    after: &StateData,
+) -> Result<(), Violation> {
+    invariant::ensure(
+        point,
+        after.revision == before.revision && after.generation == before.generation,
+        || {
+            format!(
+                "compaction moved revision {} generation {} to revision {} generation {}",
+                before.revision, before.generation, after.revision, after.generation
+            )
+        },
+    )?;
+    invariant::ensure(
+        point,
+        after.payload_catalog == before.payload_catalog,
+        || "compaction changed the payload catalog".into(),
+    )?;
+    invariant::ensure(
+        point,
+        after.objects.is_empty()
+            && after.births.is_empty()
+            && after.validated.is_empty()
+            && after.roots.is_empty(),
+        || "compaction left an unmerged overlay".into(),
+    )?;
+    // Overlay objects are keys the base lacks and overlay marks are base keys
+    // not yet validated, so neither overlaps its base count.
+    let objects = before
+        .base_objects
+        .object_count
+        .saturating_add(before.objects.len() as u64);
+    invariant::ensure(point, after.base_objects.object_count == objects, || {
+        format!(
+            "compaction holds {} objects, the state {objects}",
+            after.base_objects.object_count
+        )
+    })?;
+    let validated = before
+        .base_objects
+        .validated_count
+        .saturating_add(before.validated.len() as u64);
+    invariant::ensure(
+        point,
+        after.base_objects.validated_count == validated,
+        || {
+            format!(
+                "compaction holds {} validated objects, the state {validated}",
+                after.base_objects.validated_count
+            )
+        },
+    )?;
+    invariant::ensure(
+        point,
+        after.base_objects.root_count == before.root_count && after.root_count == before.root_count,
+        || {
+            format!(
+                "compaction holds {} roots, the state {}",
+                after.base_objects.root_count, before.root_count
+            )
+        },
+    )
+}
+
+/// One append a commit is about to make, and the log view it then caches.
+struct AppendPlan<'a> {
+    expected: RepositoryRevision,
+    result: &'a CommitResult,
+    /// The state cached once the append lands.
+    state: &'a StateData,
+    record: &'a [u8],
+    /// The position the append requires, which the record then occupies.
+    appended: wal3::LogPosition,
+    /// The checkpoint of the log the append follows.
+    base: Option<wal3::LogPosition>,
+    /// The checkpoint and tail cached for the next commit.
+    next_base: wal3::LogPosition,
+    next_tail: &'a [StateDelta],
+}
+
+/// The cached view must be what reloading the log yields once the record
+/// lands, because the next commit builds its delta on it without reading the
+/// log. A delta must also build on the checkpoint of the log it follows:
+/// collection deletes every record older than the newest checkpoint.
+fn validate_append(plan: &AppendPlan<'_>) -> Result<(), Violation> {
+    const POINT: &str = "wal3.commit";
+    let state = plan.state;
+    invariant::ensure(POINT, state.revision == plan.result.revision, || {
+        format!(
+            "caches revision {} but reports {}",
+            state.revision, plan.result.revision
+        )
+    })?;
+    let Some(base) = plan.base else {
+        return Err(Violation::new(POINT, "the log has no checkpoint"));
+    };
+    if plan.record.starts_with(STATE_MAGIC_V4) {
+        invariant::ensure(
+            POINT,
+            plan.next_base == plan.appended && plan.next_tail.is_empty(),
+            || {
+                format!(
+                    "a checkpoint at {} caches base {} and {} tail deltas",
+                    plan.appended.offset(),
+                    plan.next_base.offset(),
+                    plan.next_tail.len()
+                )
+            },
+        )?;
+        let decoded = decode_state(plan.record).map_err(|error| {
+            Violation::new(POINT, format!("checkpoint does not decode: {error}"))
+        })?;
+        invariant::ensure(
+            POINT,
+            decoded.revision == state.revision
+                && decoded.generation == state.generation
+                && decoded.base_objects == state.base_objects
+                && decoded.root_count == state.root_count
+                && decoded.payload_catalog == state.payload_catalog
+                && decoded.objects == state.objects
+                && decoded.births == state.births
+                && decoded.validated == state.validated
+                && decoded.roots == state.roots,
+            || "checkpoint encodes a different state than the one cached".into(),
+        )
+    } else if plan.record.starts_with(DELTA_MAGIC_V1) {
+        let (record_base, deltas) = decode_delta_record(plan.record).map_err(|error| {
+            Violation::new(POINT, format!("delta record does not decode: {error}"))
+        })?;
+        invariant::ensure(
+            POINT,
+            record_base == base && plan.next_base == base && base < plan.appended,
+            || {
+                format!(
+                    "a delta at {} builds on {} and caches base {}, but follows checkpoint {}",
+                    plan.appended.offset(),
+                    record_base.offset(),
+                    plan.next_base.offset(),
+                    base.offset()
+                )
+            },
+        )?;
+        invariant::ensure(POINT, deltas == plan.next_tail, || {
+            "delta record differs from the cached tail".into()
+        })?;
+        invariant::ensure(
+            POINT,
+            deltas.len() <= MAX_TAIL_DELTAS
+                && deltas.iter().all(|delta| delta.revision != delta.expected)
+                && deltas
+                    .windows(2)
+                    .all(|pair| pair[0].revision == pair[1].expected),
+            || format!("{} tail deltas do not chain", deltas.len()),
+        )?;
+        let Some(last) = deltas.last() else {
+            return Err(Violation::new(POINT, "delta record holds no delta"));
+        };
+        invariant::ensure(
+            POINT,
+            last.expected == plan.expected && last.revision == plan.result.revision,
+            || {
+                format!(
+                    "last delta moves {} to {}, the commit {} to {}",
+                    last.expected, last.revision, plan.expected, plan.result.revision
+                )
+            },
+        )
+    } else {
+        Err(Violation::new(
+            POINT,
+            "record is neither a checkpoint nor a delta",
+        ))
+    }
+}
+
 #[derive(Clone)]
 struct Wal3Snapshot {
     state: Arc<StateData>,
@@ -1565,6 +1751,19 @@ impl Wal3MetadataStore {
             MetadataError::Corruption("initialized wal3 log has no state record".to_owned())
         })?;
         let collection = retained.is_some();
+        // Both sides of the transition, kept only for checking it.
+        let previous_generation = current.generation;
+        let previous_objects = current
+            .base_objects
+            .object_count
+            .saturating_add(current.objects.len() as u64);
+        let previous_catalog = invariant::ENABLED.then(|| current.payload_catalog.clone());
+        let declared_catalog = if invariant::ENABLED {
+            mutation.payload_catalog.clone()
+        } else {
+            None
+        };
+        let declared_retained = retained.as_ref().map(|source| source.len() as u64);
         // Collection materializes replacement shards while applying its exact
         // retained set, so fence orphan GC before the first such upload.
         let mut checkpoint_lease = if collection {
@@ -1574,8 +1773,63 @@ impl Wal3MetadataStore {
         };
         let outcome = async {
             let mut delta = (!collection).then(|| StateDelta::from_mutation(expected, &mutation));
-            let (next, result) =
+            let (next, result, added) =
                 apply_mutation(&self.object_shards, current, mutation, retained).await?;
+            // The transition from a view's state to the state built on it.
+            // A rebuild replays the same delta onto a logically identical
+            // state, so the additions observed by `apply_mutation` still
+            // describe it.
+            let check_transition =
+                |previous_generation: u64, previous_catalog: Option<&[u8]>, next: &StateData| {
+                    let objects = match declared_retained {
+                        Some(retained) => ObjectChange::Collected(CollectedObjects {
+                            retained,
+                            before: previous_objects,
+                            after: next
+                                .base_objects
+                                .object_count
+                                .saturating_add(next.objects.len() as u64),
+                            // Root targets resolve only through shards this commit
+                            // would have to read back; apply_mutation already
+                            // refused a retained set that omits one.
+                            missing_root_target: None,
+                        }),
+                        // A normal mutation leaves the base shards untouched, so a
+                        // key missing from the overlay still resolves to its old
+                        // record.
+                        None => ObjectChange::Added(
+                            added
+                                .iter()
+                                .map(|(key, before)| AddedObject {
+                                    key,
+                                    before: before.as_ref(),
+                                    after: next.objects.get(key).or(before.as_ref()),
+                                })
+                                .collect(),
+                        ),
+                    };
+                    validate_commit_transition(
+                        "wal3.commit",
+                        &CommitState {
+                            revision: expected,
+                            generation: previous_generation,
+                            payload_catalog: previous_catalog,
+                        },
+                        &CommitState {
+                            revision: next.revision,
+                            generation: next.generation,
+                            payload_catalog: Some(&next.payload_catalog),
+                        },
+                        &CommitChange {
+                            payload_catalog: declared_catalog.as_deref(),
+                            objects,
+                            result: &result,
+                        },
+                    )
+                };
+            invariant::check(|| {
+                check_transition(previous_generation, previous_catalog.as_deref(), &next)
+            })?;
             if let Some(delta) = &mut delta {
                 delta.revision = result.revision;
             }
@@ -1590,6 +1844,25 @@ impl Wal3MetadataStore {
                 pause.resume.notified().await;
             }
             for attempt in 0..MAX_COMMIT_CONTENTION_ATTEMPTS {
+                // Check the plan against the view it was built on and this
+                // attempt follows, including one a retry rebuilt: the record
+                // and exactly what the success arm below caches.
+                invariant::check(|| {
+                    validate_append(&AppendPlan {
+                        expected,
+                        result: &result,
+                        state: &plan.state,
+                        record: &plan.record,
+                        appended: view.next_write_position,
+                        base: view.base_position,
+                        next_base: plan.delta_base.unwrap_or(view.next_write_position),
+                        next_tail: if plan.delta_base.is_some() {
+                            &plan.tail_deltas
+                        } else {
+                            &[]
+                        },
+                    })
+                })?;
                 match self
                     .writer
                     .append_with_options_outcome(
@@ -1689,7 +1962,17 @@ impl Wal3MetadataStore {
                                             "initialized wal3 log has no state record".to_owned(),
                                         )
                                     })?;
+                                    let previous_generation = state.generation;
+                                    let previous_catalog =
+                                        invariant::ENABLED.then(|| state.payload_catalog.clone());
                                     apply_delta(&self.object_shards, &mut state, delta).await?;
+                                    invariant::check(|| {
+                                        check_transition(
+                                            previous_generation,
+                                            previous_catalog.as_deref(),
+                                            &state,
+                                        )
+                                    })?;
                                     state
                                 }
                                 // A collection's checkpoint is its whole state
@@ -1838,6 +2121,7 @@ impl Wal3MetadataStore {
             *checkpoint_lease = Some(self.object_shards.acquire_checkpoint_barrier().await?);
         }
         let state = compact_state_objects(&self.object_shards, &next).await?;
+        invariant::check(|| validate_compaction("wal3.checkpoint", &next, &state))?;
         let record = encode_state(&state)?;
         Ok(PlannedAppend {
             checkpoint_bytes: record.len() as u64,
@@ -1898,12 +2182,21 @@ fn next_generation(generation: u64) -> Result<u64, MetadataError> {
         .ok_or_else(|| MetadataError::Backend("metadata generation exhausted".into()))
 }
 
+/// Apply `mutation` to `state`. Invariant-checking builds also return each
+/// added key with the record it resolved to before the mutation.
 async fn apply_mutation(
     shards: &ObjectShardStorage,
     mut state: StateData,
     mutation: MetadataMutation,
     retained: Option<Arc<dyn RetainedObjects>>,
-) -> Result<(StateData, CommitResult), MetadataError> {
+) -> Result<
+    (
+        StateData,
+        CommitResult,
+        Vec<(ObjectKey, Option<ObjectRecord>)>,
+    ),
+    MetadataError,
+> {
     mutation.reject_mixed_collection()?;
     state.generation = next_generation(state.generation)?;
     let mut result = CommitResult {
@@ -1912,6 +2205,7 @@ async fn apply_mutation(
         objects_removed: 0,
         roots_changed: 0,
     };
+    let mut added = Vec::new();
     if let Some(retained) = retained {
         let previous = state
             .base_objects
@@ -1988,8 +2282,14 @@ async fn apply_mutation(
     } else {
         for verified in mutation.objects {
             let record = verified.into_record();
-            match lookup_state_object(shards, &state, record.key()).await? {
-                Some((existing, _, _)) if existing == record => {}
+            let existing = lookup_state_object(shards, &state, record.key())
+                .await?
+                .map(|(existing, _, _)| existing);
+            if invariant::ENABLED {
+                added.push((record.key().clone(), existing.clone()));
+            }
+            match existing {
+                Some(existing) if existing == record => {}
                 Some(_) => return Err(MetadataError::ImmutableConflict(record.key().clone())),
                 None => {
                     state.births.insert(record.key().clone(), state.generation);
@@ -2054,7 +2354,7 @@ async fn apply_mutation(
         state.payload_catalog = payload_catalog;
     }
     state.revision = result.revision;
-    Ok((state, result))
+    Ok((state, result, added))
 }
 
 fn validate_retained_page(
@@ -3653,9 +3953,10 @@ mod tests {
         let retained_source = mutation.retained_objects().unwrap().clone();
         let reader = ObjectShardStorage::new(storage, "state".to_owned(), total_bytes * 2);
 
-        let (collected, result) = apply_mutation(&reader, state, mutation, Some(retained_source))
-            .await
-            .unwrap();
+        let (collected, result, _) =
+            apply_mutation(&reader, state, mutation, Some(retained_source))
+                .await
+                .unwrap();
 
         assert_eq!(result.objects_removed, 0);
         assert_eq!(collected.base_objects, original);
@@ -3694,9 +3995,10 @@ mod tests {
         let retained_source = mutation.retained_objects().unwrap().clone();
         let reader = ObjectShardStorage::new(storage, "state".to_owned(), total_bytes * 2);
 
-        let (collected, result) = apply_mutation(&reader, state, mutation, Some(retained_source))
-            .await
-            .unwrap();
+        let (collected, result, _) =
+            apply_mutation(&reader, state, mutation, Some(retained_source))
+                .await
+                .unwrap();
 
         assert_eq!(result.objects_removed, 1);
         assert_eq!(reader.stats().get_requests, 3);
