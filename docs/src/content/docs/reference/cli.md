@@ -86,6 +86,14 @@ directory omits its `.casita` marker.
 imports. Roots are permanent by default; omitting the flag keeps an existing
 root's policy. Git, Casitar, and OCI imports do not accept this flag.
 
+The filesystem importer prints the directory key and does not follow
+symlinks. It may reuse a file whose device, inode, size, and timestamps match
+the previous import. `--filesystem-rehash` reads every file again. Use
+`--filesystem-concurrency FILES` to change the number of files ingested at
+once (default 16), and `--chunk-upload-concurrency CHUNKS` to bound uploads
+per blob writer (default 32). See [Import semantics](../../concepts/imports/)
+for the reuse assumption.
+
 ### `import -i oci`
 
 ```text
@@ -108,14 +116,6 @@ layer whiteouts and verifies uncompressed DiffIDs before publishing both
 roots atomically. The filesystem bounds limit decoded tar bytes and entries;
 the blob bounds limit the original compressed downloads.
 See [Import an OCI Image](../../guides/oci/) for the output and limits.
-
-The importer prints the directory key and does not follow symlinks. It may
-reuse a file whose device, inode, size, and timestamps match the previous
-import. `--filesystem-rehash` reads every file again. Use
-`--filesystem-concurrency FILES` to change the number of files ingested at
-once (default 16), and `--chunk-upload-concurrency CHUNKS` to bound uploads
-per blob writer (default 32). See [Import semantics](../../concepts/imports/)
-for the reuse assumption.
 
 ### `import -i tar`
 
