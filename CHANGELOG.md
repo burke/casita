@@ -13,6 +13,15 @@ and will use [Semantic Versioning](https://semver.org/) for tagged releases.
 
 ### Added
 
+- Every commit point checks the transition it is about to make durable
+  before making it: metadata commits in the Turso, wal3 and memory stores,
+  wal3 checkpoints, shards, barriers and repository holds, pack catalog
+  pointers, pack retirement, replacement and deletion claims, and pin-ledger
+  writes, journal appends and checkpoints. Debug builds panic on a broken
+  invariant, so a defect fails the test that reaches it instead of
+  surfacing later as corruption. Release builds compiled with
+  `RUSTFLAGS="--cfg casita_invariants"` refuse the commit as corruption
+  instead; other release builds skip the checks.
 - `RepositoryGeneration` orders the logical states of one repository.
   `MetadataReader::generation` and `RetainedReader::generation` report a
   reader's position in the commit order, so an application holding several
