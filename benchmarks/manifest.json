@@ -1658,6 +1658,20 @@
       ]
     },
     {
+      "id": "wal3-commit-preparation",
+      "suite_id": "state-and-publication",
+      "title": "WAL3 commit tail preparation at checkpoint count and byte limits",
+      "kind": "module",
+      "target": "benchmarks.suites.native_probes",
+      "default_arguments": [
+        "--probe",
+        "wal3-commit-preparation"
+      ],
+      "profiles": [
+        "custom"
+      ]
+    },
+    {
       "id": "logical-state",
       "suite_id": "state-and-publication",
       "title": "Logical state shard scaling",

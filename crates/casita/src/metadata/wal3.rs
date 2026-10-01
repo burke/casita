@@ -34,6 +34,10 @@ use crate::object::{ObjectKey, ObjectRecord, RepositoryRevision, RootName, RootR
 #[path = "wal3/experiments.rs"]
 mod experiments;
 
+#[cfg(test)]
+#[path = "wal3/commit_benchmarks.rs"]
+mod commit_benchmarks;
+
 mod coordination;
 pub use coordination::Wal3RepositoryHold;
 
@@ -1124,6 +1128,29 @@ impl LoadedState {
             MetadataError::Corruption("initialized wal3 log has no checkpoint position".to_owned())
         })
     }
+
+    /// Whether `other` ends at the same append position and checkpoint.
+    /// Appends advance the log position even when the revision stays equal,
+    /// as with a WAL collection's checkpoint. The owned tail may have moved
+    /// into a planned append, so compare its immutable log positions instead.
+    fn describes_same_log(&self, other: &Self) -> bool {
+        self.next_write_position == other.next_write_position
+            && self.base_position == other.base_position
+    }
+}
+
+/// A record to append after one loaded log view, and what to cache once it
+/// lands there.
+struct PlannedAppend {
+    record: Vec<u8>,
+    /// The state after the append; a checkpoint record encodes exactly this.
+    state: StateData,
+    /// The view's tail plus this commit's delta, if it has one.
+    tail_deltas: Vec<StateDelta>,
+    /// The checkpoint a delta record builds on; `None` for a checkpoint
+    /// record, which becomes the base where it lands.
+    delta_base: Option<wal3::LogPosition>,
+    checkpoint_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -1531,61 +1558,15 @@ impl Wal3MetadataStore {
         expected: RepositoryRevision,
         mutation: MetadataMutation,
         retained: Option<Arc<dyn RetainedObjects>>,
-        mut loaded: LoadedState,
+        loaded: LoadedState,
     ) -> Result<CommitResult, MetadataError> {
-        // Cached checkpoints are hints. Pin their files and validate the exact
-        // manifest before reading a shard, including during a logical prune.
-        let mut pinned = None;
-        for _ in 0..MAX_COMMIT_CONTENTION_ATTEMPTS {
-            let state = loaded.state.as_ref().ok_or_else(|| {
-                MetadataError::Corruption("initialized wal3 log has no state record".into())
-            })?;
-            if state.revision != expected {
-                return Err(MetadataError::StaleRevision {
-                    expected,
-                    actual: state.revision,
-                });
-            }
-            let pin = match self.pin_state_shards(state).await {
-                Ok(pin) => pin,
-                Err(error) => {
-                    if matches!(
-                        self.manifest_is_current(
-                            &self.reader().await?,
-                            &loaded.manifest_and_witness
-                        )
-                        .await,
-                        Ok(false)
-                    ) {
-                        loaded = self.load_state_at_manifest().await?;
-                        continue;
-                    }
-                    return Err(error);
-                }
-            };
-            if pin.is_none()
-                || self
-                    .manifest_is_current(&self.reader().await?, &loaded.manifest_and_witness)
-                    .await?
-            {
-                pinned = Some(pin);
-                break;
-            }
-            drop(pin);
-            loaded = self.load_state_at_manifest().await?;
-        }
-        let _read_pin = pinned.ok_or_else(|| {
-            MetadataError::Transient("metadata changed during commit shard admission".into())
-        })?;
-        let current = loaded.state.take().ok_or_else(|| {
+        let (mut view, read_pin) = self.admit_loaded(expected, loaded).await?;
+        // Every view a record is built on keeps its shards pinned until the
+        // commit settles, because a checkpoint record may reference them.
+        let mut read_pins = Vec::from_iter(read_pin);
+        let current = view.state.take().ok_or_else(|| {
             MetadataError::Corruption("initialized wal3 log has no state record".to_owned())
         })?;
-        if current.revision != expected {
-            return Err(MetadataError::StaleRevision {
-                expected,
-                actual: current.revision,
-            });
-        }
         let collection = retained.is_some();
         // Collection materializes replacement shards while applying its exact
         // retained set, so fence orphan GC before the first such upload.
@@ -1594,80 +1575,31 @@ impl Wal3MetadataStore {
         } else {
             None
         };
-        let mut delta = (!collection).then(|| StateDelta::from_mutation(expected, &mutation));
-        let (mut next, result) =
-            match apply_mutation(&self.object_shards, current, mutation, retained).await {
-                Ok(applied) => applied,
-                Err(error) => {
-                    if let Some(lease) = &checkpoint_lease {
-                        let _ = self.object_shards.release_barrier(lease).await;
-                    }
-                    return Err(error);
-                }
-            };
-        if let Some(delta) = &mut delta {
-            delta.revision = result.revision;
-        }
-        // Collection is an exact replacement and must not retain or republish
-        // pre-collection additions from the old cumulative tail.
-        let mut tail_deltas = if collection {
-            Vec::new()
-        } else {
-            loaded.tail_deltas.clone()
-        };
-        if let Some(delta) = delta {
-            tail_deltas.push(delta);
-        }
-        let base_position = loaded.base_position()?;
-        let delta_record = encode_delta_record(base_position, &tail_deltas);
-        let install_checkpoint = tail_deltas.len() > MAX_TAIL_DELTAS
-            || delta_record.len() > MAX_DELTA_RECORD_BYTES
-            || tail_deltas.is_empty();
-        if install_checkpoint && checkpoint_lease.is_none() {
-            checkpoint_lease = Some(self.object_shards.acquire_checkpoint_barrier().await?);
-        }
-        let record = if install_checkpoint {
-            next = match compact_state_objects(&self.object_shards, &next).await {
-                Ok(next) => next,
-                Err(error) => {
-                    if let Some(lease) = &checkpoint_lease {
-                        let _ = self.object_shards.release_barrier(lease).await;
-                    }
-                    return Err(error);
-                }
-            };
-            match encode_state(&next) {
-                Ok(record) => record,
-                Err(error) => {
-                    if let Some(lease) = &checkpoint_lease {
-                        let _ = self.object_shards.release_barrier(lease).await;
-                    }
-                    return Err(error);
-                }
-            }
-        } else {
-            delta_record
-        };
-        #[cfg(test)]
-        if install_checkpoint && let Some(pause) = &self.checkpoint_pause {
-            pause.reached.notify_one();
-            pause.resume.notified().await;
-        }
-        let appended_position = loaded.next_write_position;
-        let (next_base_position, next_tail_deltas, checkpoint_bytes) = if install_checkpoint {
-            (appended_position, Vec::new(), record.len() as u64)
-        } else {
-            (base_position, tail_deltas, loaded.checkpoint_bytes)
-        };
         let outcome = async {
+            let mut delta = (!collection).then(|| StateDelta::from_mutation(expected, &mutation));
+            let (next, result) =
+                apply_mutation(&self.object_shards, current, mutation, retained).await?;
+            if let Some(delta) = &mut delta {
+                delta.revision = result.revision;
+            }
+            let mut plan = self
+                .plan_append(&mut view, next, delta, &mut checkpoint_lease)
+                .await?;
+            #[cfg(test)]
+            if plan.delta_base.is_none()
+                && let Some(pause) = &self.checkpoint_pause
+            {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
             for attempt in 0..MAX_COMMIT_CONTENTION_ATTEMPTS {
                 match self
                     .writer
                     .append_with_options_outcome(
-                        record.clone(),
+                        plan.record.clone(),
                         Some(
                             wal3::AppendOptions::default()
-                                .with_required_fragment_start(loaded.next_write_position),
+                                .with_required_fragment_start(view.next_write_position),
                         ),
                     )
                     .await
@@ -1685,15 +1617,22 @@ impl Wal3MetadataStore {
                                 "invalid wal3 manifest after commit: {error}"
                             ))
                         })?;
+                        // The append required the position `view` ends at,
+                        // so nothing was appended since `view` was loaded and
+                        // the record occupies exactly that position.
+                        let (base_position, tail_deltas) = match plan.delta_base {
+                            Some(base_position) => (base_position, plan.tail_deltas),
+                            None => (view.next_write_position, Vec::new()),
+                        };
                         self.cache_loaded(LoadedState {
-                            state: Some(next),
+                            state: Some(plan.state),
                             next_write_position: manifest_and_witness
                                 .manifest
                                 .next_write_timestamp(),
                             manifest_and_witness,
-                            checkpoint_bytes,
-                            base_position: Some(next_base_position),
-                            tail_deltas: next_tail_deltas,
+                            checkpoint_bytes: plan.checkpoint_bytes,
+                            base_position: Some(base_position),
+                            tail_deltas,
                         })?;
                         return Ok(result);
                     }
@@ -1703,8 +1642,8 @@ impl Wal3MetadataStore {
                             contention = "retryable",
                             "WAL3 append contended"
                         );
-                        loaded = self.load_state_at_manifest().await?;
-                        let actual_revision = loaded
+                        let reloaded = self.load_state_at_manifest().await?;
+                        let actual_revision = reloaded
                             .state
                             .as_ref()
                             .ok_or_else(|| {
@@ -1714,7 +1653,7 @@ impl Wal3MetadataStore {
                             })?
                             .revision;
                         if actual_revision == result.revision {
-                            self.cache_loaded(loaded)?;
+                            self.cache_loaded(reloaded)?;
                             self.record_successful_append();
                             return Ok(result);
                         }
@@ -1731,6 +1670,38 @@ impl Wal3MetadataStore {
                                 "logical checkpoint publication was fenced by maintenance"
                                     .to_owned(),
                             ));
+                        }
+                        if !view.describes_same_log(&reloaded) {
+                            // An append kept the revision but moved the log,
+                            // typically a WAL collection's checkpoint. The
+                            // record and the view it would cache belong to
+                            // the old log: a delta names a checkpoint that
+                            // collection deletes, and a checkpoint would be
+                            // cached at a position it no longer lands at.
+                            let (admitted, read_pin) =
+                                self.admit_loaded(expected, reloaded).await?;
+                            read_pins.extend(read_pin);
+                            view = admitted;
+                            let delta = plan.tail_deltas.pop();
+                            let next = match &delta {
+                                // Replay the delta exactly as loading this
+                                // log will, so the cache matches a reload.
+                                Some(delta) => {
+                                    let mut state = view.state.take().ok_or_else(|| {
+                                        MetadataError::Corruption(
+                                            "initialized wal3 log has no state record".to_owned(),
+                                        )
+                                    })?;
+                                    apply_delta(&self.object_shards, &mut state, delta).await?;
+                                    state
+                                }
+                                // A collection's checkpoint is its whole state
+                                // and names no earlier record.
+                                None => plan.state,
+                            };
+                            plan = self
+                                .plan_append(&mut view, next, delta, &mut checkpoint_lease)
+                                .await?;
                         }
                         let delay_ms = 1_u64 << attempt.min(6);
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -1780,6 +1751,95 @@ impl Wal3MetadataStore {
             let _ = self.object_shards.release_barrier(lease).await;
         }
         outcome
+    }
+
+    /// Pin the shards `loaded` references and confirm its manifest is still
+    /// current, reloading until both hold. A cached or reloaded view is only a
+    /// hint until then: collection deletes the shards of a superseded
+    /// checkpoint. A view referencing no shards has nothing to protect and is
+    /// admitted as is; an append built on it still requires the exact position
+    /// the view ends at, and is rebuilt if the log moved.
+    async fn admit_loaded(
+        &self,
+        expected: RepositoryRevision,
+        mut loaded: LoadedState,
+    ) -> Result<(LoadedState, Option<super::DataPinLease>), MetadataError> {
+        for _ in 0..MAX_COMMIT_CONTENTION_ATTEMPTS {
+            let state = loaded.state.as_ref().ok_or_else(|| {
+                MetadataError::Corruption("initialized wal3 log has no state record".into())
+            })?;
+            if state.revision != expected {
+                return Err(MetadataError::StaleRevision {
+                    expected,
+                    actual: state.revision,
+                });
+            }
+            let pin = match self.pin_state_shards(state).await {
+                Ok(pin) => pin,
+                Err(error) => {
+                    if matches!(
+                        self.manifest_is_current(
+                            &self.reader().await?,
+                            &loaded.manifest_and_witness
+                        )
+                        .await,
+                        Ok(false)
+                    ) {
+                        loaded = self.load_state_at_manifest().await?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            if pin.is_none()
+                || self
+                    .manifest_is_current(&self.reader().await?, &loaded.manifest_and_witness)
+                    .await?
+            {
+                return Ok((loaded, pin));
+            }
+            drop(pin);
+            loaded = self.load_state_at_manifest().await?;
+        }
+        Err(MetadataError::Transient(
+            "metadata changed during commit shard admission".into(),
+        ))
+    }
+
+    /// Build the record that appends `next` after `view`. `delta` is `None`
+    /// for a collection, whose record is always a checkpoint.
+    async fn plan_append(
+        &self,
+        view: &mut LoadedState,
+        next: StateData,
+        delta: Option<StateDelta>,
+        checkpoint_lease: &mut Option<super::wal3_shard::ShardBarrierLease>,
+    ) -> Result<PlannedAppend, MetadataError> {
+        // Collection is an exact replacement and must not retain or republish
+        // pre-collection additions from the old cumulative tail.
+        let base_position = view.base_position()?;
+        let tail_deltas = take_commit_tail(&mut view.tail_deltas, delta);
+        if let Some(delta_record) = encode_commit_delta(base_position, &tail_deltas) {
+            return Ok(PlannedAppend {
+                record: delta_record,
+                state: next,
+                tail_deltas,
+                delta_base: Some(base_position),
+                checkpoint_bytes: view.checkpoint_bytes,
+            });
+        }
+        if checkpoint_lease.is_none() {
+            *checkpoint_lease = Some(self.object_shards.acquire_checkpoint_barrier().await?);
+        }
+        let state = compact_state_objects(&self.object_shards, &next).await?;
+        let record = encode_state(&state)?;
+        Ok(PlannedAppend {
+            checkpoint_bytes: record.len() as u64,
+            record,
+            state,
+            tail_deltas,
+            delta_base: None,
+        })
     }
 }
 
@@ -2576,6 +2636,27 @@ async fn flush_root_shard(
     Ok(())
 }
 
+/// Move the prior tail into an ordinary commit; collection starts a fresh tail.
+fn take_commit_tail(tail: &mut Vec<StateDelta>, delta: Option<StateDelta>) -> Vec<StateDelta> {
+    match delta {
+        Some(delta) => {
+            let mut tail = std::mem::take(tail);
+            tail.push(delta);
+            tail
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Only serialize tails that could be appended without a full checkpoint.
+fn encode_commit_delta(base_position: wal3::LogPosition, deltas: &[StateDelta]) -> Option<Vec<u8>> {
+    if deltas.is_empty() || deltas.len() > MAX_TAIL_DELTAS {
+        return None;
+    }
+    let record = encode_delta_record(base_position, deltas);
+    (record.len() <= MAX_DELTA_RECORD_BYTES).then_some(record)
+}
+
 fn encode_delta_record(base_position: wal3::LogPosition, deltas: &[StateDelta]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(DELTA_MAGIC_V1);
@@ -2772,8 +2853,7 @@ fn encode_state(state: &StateData) -> Result<Vec<u8>, MetadataError> {
     Ok(out)
 }
 
-fn put_entries(out: &mut Vec<u8>, entries: impl IntoIterator<Item = Vec<u8>>) {
-    let entries = entries.into_iter().collect::<Vec<_>>();
+fn put_entries(out: &mut Vec<u8>, entries: impl ExactSizeIterator<Item = Vec<u8>>) {
     out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
     for entry in entries {
         out.extend_from_slice(&(entry.len() as u64).to_le_bytes());
@@ -5566,5 +5646,161 @@ mod tests {
             hold.verify_closure(&second_root).await.unwrap(),
             crate::ClosureStatus::Complete { .. }
         ));
+    }
+
+    // A WAL collection appends a checkpoint without changing the revision. A
+    // writer whose view of the log predates it misses that checkpoint's
+    // position, reloads the same revision, and must rebuild its append on the
+    // log as it now is. The writer's cached base references no shards, so it
+    // is used without re-reading the manifest, which makes the miss certain.
+
+    async fn assert_a_fresh_handle_reads(
+        storage: Arc<chroma_storage::Storage>,
+        prefix: &str,
+        revision: RepositoryRevision,
+        present: &[ObjectKey],
+        absent: &[ObjectKey],
+    ) {
+        let reader = Wal3MetadataStore::open(storage, prefix, "reader")
+            .await
+            .unwrap();
+        let snapshot = reader.snapshot().await.unwrap();
+        assert_eq!(snapshot.revision(), revision);
+        for key in present {
+            assert!(snapshot.object(key).await.unwrap().is_some(), "{key}");
+        }
+        for key in absent {
+            assert!(snapshot.object(key).await.unwrap().is_none(), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rustfs_a_delta_commit_retried_past_a_wal_collection_keeps_the_log_readable() {
+        let _lock = rustfs_test_lock().lock().await;
+        let rustfs = Rustfs::start();
+        let storage = rustfs_storage(&rustfs).await;
+        let prefix = "retried-delta/state";
+        let writer = Wal3MetadataStore::open(storage.clone(), prefix, "writer")
+            .await
+            .unwrap();
+        let collector = Wal3MetadataStore::open(storage.clone(), prefix, "collector")
+            .await
+            .unwrap();
+        let objects = [
+            verified_blob(b"written before the collection").await,
+            verified_blob(b"written after the collection").await,
+            verified_blob(b"written by the next commit").await,
+        ];
+        let keys = objects
+            .iter()
+            .map(|object| object.record().key().clone())
+            .collect::<Vec<_>>();
+        let [before, retried, next] = objects;
+
+        let mut mutation = MetadataMutation::new();
+        mutation.add_object(before);
+        let expected = writer
+            .commit(&writer.opened_snapshot().revision(), mutation)
+            .await
+            .unwrap()
+            .revision;
+        collector.collect_wal(Duration::ZERO).await.unwrap();
+
+        let mut mutation = MetadataMutation::new();
+        mutation.add_object(retried);
+        let expected = writer.commit(&expected, mutation).await.unwrap().revision;
+        let mut mutation = MetadataMutation::new();
+        mutation.add_object(next);
+        let committed = writer.commit(&expected, mutation).await.unwrap().revision;
+        assert_a_fresh_handle_reads(storage, prefix, committed, &keys, &[]).await;
+    }
+
+    #[tokio::test]
+    async fn rustfs_a_checkpointing_commit_retried_past_a_wal_collection_keeps_the_log_readable() {
+        let _lock = rustfs_test_lock().lock().await;
+        let rustfs = Rustfs::start();
+        let storage = rustfs_storage(&rustfs).await;
+        let prefix = "retried-checkpoint/state";
+        let writer = Wal3MetadataStore::open(storage.clone(), prefix, "writer")
+            .await
+            .unwrap();
+        let collector = Wal3MetadataStore::open(storage.clone(), prefix, "collector")
+            .await
+            .unwrap();
+        let mut expected = writer.opened_snapshot().revision();
+        for _ in 0..MAX_TAIL_DELTAS {
+            expected = writer
+                .commit(&expected, MetadataMutation::new())
+                .await
+                .unwrap()
+                .revision;
+        }
+        collector.collect_wal(Duration::ZERO).await.unwrap();
+
+        // One delta past a full tail: this commit plans a checkpoint.
+        let object = verified_blob(b"committed past the collection").await;
+        let key = object.record().key().clone();
+        let mut mutation = MetadataMutation::new();
+        mutation.add_object(object);
+        let expected = writer.commit(&expected, mutation).await.unwrap().revision;
+        let committed = writer
+            .commit(&expected, MetadataMutation::new())
+            .await
+            .unwrap()
+            .revision;
+        assert_a_fresh_handle_reads(storage, prefix, committed, &[key], &[]).await;
+    }
+
+    #[tokio::test]
+    async fn rustfs_a_logical_collection_retried_past_a_wal_collection_keeps_the_log_readable() {
+        let _lock = rustfs_test_lock().lock().await;
+        let rustfs = Rustfs::start();
+        let storage = rustfs_storage(&rustfs).await;
+        let prefix = "retried-collection/state";
+        let writer = Wal3MetadataStore::open(storage.clone(), prefix, "writer")
+            .await
+            .unwrap();
+        let collector = Wal3MetadataStore::open(storage.clone(), prefix, "collector")
+            .await
+            .unwrap();
+        let kept = verified_blob(b"kept by the logical collection").await;
+        let dropped = verified_blob(b"dropped by the logical collection").await;
+        let later = verified_blob(b"written after the logical collection").await;
+        let kept_key = kept.record().key().clone();
+        let dropped_key = dropped.record().key().clone();
+        let later_key = later.record().key().clone();
+
+        let mut mutation = MetadataMutation::new();
+        mutation.add_object(kept).add_object(dropped);
+        let expected = writer
+            .commit(&writer.opened_snapshot().revision(), mutation)
+            .await
+            .unwrap()
+            .revision;
+        collector.collect_wal(Duration::ZERO).await.unwrap();
+
+        let collected = writer
+            .commit(
+                &expected,
+                MetadataMutation::install_retained_objects(BTreeSet::from([kept_key.clone()])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(collected.objects_removed, 1);
+        let mut mutation = MetadataMutation::new();
+        mutation.add_object(later);
+        let committed = writer
+            .commit(&collected.revision, mutation)
+            .await
+            .unwrap()
+            .revision;
+        assert_a_fresh_handle_reads(
+            storage,
+            prefix,
+            committed,
+            &[kept_key, later_key],
+            &[dropped_key],
+        )
+        .await;
     }
 }

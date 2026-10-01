@@ -12,7 +12,7 @@ service.
 ### CLI
 
 ```console
-$ casita --repository ./cache import ./project \
+$ casita import ./project \
     --git-view upstream \
     --git-ref refs/heads/main
 ```
@@ -77,7 +77,7 @@ creates a new immutable view and repoints the destination-owned root.
 ## 3. Materialize an exact tree
 
 ```console
-$ casita --repository ./cache git checkout \
+$ casita git checkout \
     git.sha1.tree.v1:... ./tree
 ```
 
@@ -90,7 +90,7 @@ empty directories for them instead.
 With smart-HTTP support enabled, bind one immutable view:
 
 ```console
-$ casita --repository ./cache git serve upstream \
+$ casita git serve upstream \
     --listen 127.0.0.1:9418
 ```
 

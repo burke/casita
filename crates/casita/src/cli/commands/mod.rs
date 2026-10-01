@@ -13,6 +13,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 #[cfg(test)]
 use super::LogFormat;
+#[cfg(feature = "oci")]
+use super::OciImportArgs;
 #[cfg(feature = "ssh")]
 use super::SshSourceArgs;
 use super::{
@@ -362,6 +364,72 @@ where
         "file-bytes {}; sparse-expansion-bytes {}",
         report.file_bytes, report.sparse_expansion_bytes
     );
+    Ok(())
+}
+
+#[cfg(feature = "oci")]
+async fn import_oci<PS, SS>(
+    repository: &casita::experimental::Repository<PS, SS>,
+    reference: &Path,
+    name: RootName,
+    args: OciImportArgs,
+    rootfs_name: Option<RootName>,
+) -> Result<(), Error>
+where
+    PS: casita::experimental::BlobStore,
+    SS: casita::experimental::MetadataStore + 'static,
+{
+    use oci_client::client::{ClientConfig, ClientProtocol};
+    use oci_client::{Client, Reference};
+
+    let reference: Reference = reference
+        .to_str()
+        .ok_or_else(|| usage_error("OCI image reference must be UTF-8"))?
+        .parse()?;
+    let mut config = ClientConfig::default();
+    if args.http {
+        config.protocol = ClientProtocol::Http;
+    }
+    if let Some(platform) = args.platform.as_deref() {
+        let parts: Vec<_> = platform.split('/').collect();
+        if !(2..=3).contains(&parts.len()) || parts.iter().any(|part| part.is_empty()) {
+            return Err(usage_error("--oci-platform requires OS/ARCH[/VARIANT]"));
+        }
+    }
+    let limits = casita::OciImportLimits {
+        max_blob_bytes: args.max_blob_bytes,
+        max_total_blob_bytes: args.max_total_blob_bytes,
+        ..Default::default()
+    };
+    let mut request = casita::import::OciImport::new(reference, name.clone())
+        .with_client(Client::new(config))
+        .with_limits(limits);
+    if let Some(platform) = args.platform {
+        request = request.with_platform(platform);
+    }
+    if let Some(root) = rootfs_name.as_ref() {
+        request = request
+            .with_rootfs(root.clone())
+            .with_rootfs_limits(casita::OciRootfsLimits {
+                max_layer_bytes: args.rootfs_max_bytes,
+                max_total_archive_bytes: args.rootfs_max_bytes,
+                max_entries: args.rootfs_max_entries,
+                max_tree_entries: args.rootfs_max_entries,
+                ..Default::default()
+            });
+    }
+    let report = request.import(repository).await?;
+    println!("root {}", report.root);
+    println!("name {name}");
+    println!("manifest {}", report.manifest_digest);
+    println!("layers {}; blob-bytes {}", report.layers, report.blob_bytes);
+    if let Some(key) = report.rootfs {
+        println!("rootfs {key}");
+        println!(
+            "rootfs-name {}",
+            rootfs_name.expect("requested filesystem root")
+        );
+    }
     Ok(())
 }
 
@@ -1919,6 +1987,24 @@ async fn run_inner(cli: Cli) -> Result<(), Error> {
                     args.retention.map(Into::into),
                 )
                 .await;
+            }
+            #[cfg(feature = "oci")]
+            if importer == super::ImporterKind::Oci {
+                if args.retention.is_some() {
+                    return Err(usage_error("--retention does not support OCI imports"));
+                }
+                let name = args
+                    .name
+                    .map(|name| scoped_root(workspace.as_ref(), name))
+                    .transpose()?
+                    .ok_or_else(|| usage_error("OCI import requires --root"))?;
+                let rootfs_name = args
+                    .oci
+                    .rootfs_root
+                    .as_ref()
+                    .map(|name| scoped_root(workspace.as_ref(), name))
+                    .transpose()?;
+                return import_oci(&repository, &args.path, name, args.oci, rootfs_name).await;
             }
             if importer == super::ImporterKind::Casitar {
                 if args.retention.is_some() {

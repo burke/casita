@@ -56,7 +56,8 @@ The supported Rust API uses the non-generic casita::Repository: Repository::loca
           items: [
             { label: 'Filesystem', slug: 'guides/filesystem' },
             { label: 'Tar Archive', slug: 'guides/tar' },
-            { label: 'Native Git', slug: 'guides/git' },
+            { label: 'OCI Image', slug: 'guides/oci' },
+            { label: 'Git', slug: 'guides/git' },
             { label: 'Casitar Archive', slug: 'guides/casitar' },
             { label: 'Adding a New Importer', slug: 'guides/adding-an-importer' },
           ],

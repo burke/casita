@@ -53,6 +53,7 @@ full workflow.
 | --- | --- | --- |
 | Git repository | Native Git objects and an immutable ref view under `git/<view>`. | [Git](../../guides/git/) |
 | Decompressed tar stream | A canonical filesystem tree, without extracting the archive first. | [Tar](../../guides/tar/) |
+| OCI registry image | A single-platform OCI image layout with a bounded config and streamed, digest-verified layers, plus an optional merged filesystem. Requires the `oci` feature. | [OCI](../../guides/oci/) |
 | Casitar archive | Verified objects and destination-owned root mappings after the archive's declared closure checks pass. | [Casitar](../../guides/casitar/) |
 
 IPLD and custom formats also publish through ordinary mutation sessions. See

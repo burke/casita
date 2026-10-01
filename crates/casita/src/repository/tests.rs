@@ -5027,10 +5027,10 @@ async fn composed_repository_takes_on_the_local_profile() {
 async fn collection_deletes_only_after_the_commits_that_allow_it_are_durable() {
     let temporary = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temporary.path().join("blobs")).unwrap();
+    // Loose collection unlinks immediately. Packed removal counts can instead
+    // describe catalog retirement while changed pins defer physical deletion.
     let repository = Repository::new(
-        crate::ChunkedBlobStore::local_packed(temporary.path().join("blobs"))
-            .await
-            .unwrap(),
+        crate::ChunkedBlobStore::local(temporary.path().join("blobs")).unwrap(),
         crate::TursoMetadataStore::open(temporary.path().join("casita.sqlite"))
             .await
             .unwrap(),
@@ -5039,6 +5039,7 @@ async fn collection_deletes_only_after_the_commits_that_allow_it_are_durable() {
     let name: RootName = "collected".parse().unwrap();
     let session = repository.mutation_session().await.unwrap();
     let object = session.stage_blob(&vec![7; 1 << 20]).await.unwrap();
+    let payload = object.record().payload();
     let key = object.record().key().clone();
     session
         .publish_rooted(vec![object], name.clone(), key)
@@ -5053,37 +5054,15 @@ async fn collection_deletes_only_after_the_commits_that_allow_it_are_durable() {
         .await
         .unwrap();
 
-    // A pass can prune logically and defer its physical deletions to a later
-    // pass (for example, when catalog pins changed meanwhile). The flush is
-    // owed to deletions, so check each pass that deleted a file.
-    fn files(directory: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
-        let mut found = std::collections::BTreeSet::new();
-        for entry in std::fs::read_dir(directory).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                found.extend(files(&path));
-            } else {
-                found.insert(path);
-            }
-        }
-        found
-    }
-    let payloads = temporary.path().join("blobs");
-    let stored = files(&payloads);
+    assert!(repository.payloads().has(&payload).await.unwrap());
     let before = commits.flushes();
-    let mut removed = 0;
-    for _ in 0..16 {
-        removed += repository.collect().await.unwrap().removed.payload_blobs;
-        if !stored.is_subset(&files(&payloads)) {
-            assert!(
-                commits.flushes() > before,
-                "collection deleted payloads without first flushing the commit that allowed it"
-            );
-            assert!(removed > 0);
-            return;
-        }
-    }
-    panic!("collection never deleted the removed root's payloads");
+    let outcome = repository.collect().await.unwrap();
+    assert!(outcome.removed.payload_blobs > 0, "{outcome:?}");
+    assert!(!repository.payloads().has(&payload).await.unwrap());
+    assert!(
+        commits.flushes() > before,
+        "collection deleted payloads without first flushing the commit that allowed it"
+    );
 }
 
 #[tokio::test]

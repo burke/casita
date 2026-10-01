@@ -171,6 +171,8 @@ mod linked;
 mod nar;
 mod node;
 mod object;
+#[cfg(feature = "oci")]
+mod oci;
 mod path;
 #[cfg(feature = "native")]
 mod repository;
@@ -224,6 +226,8 @@ pub use object::{
     NamespaceId, NamespaceIdError, ObjectKey, ObjectKeyError, ObjectRecord, RepositoryGeneration,
     RepositoryRevision, RepositoryRevisionError, RootName, RootNameError, RootRecord,
 };
+#[cfg(feature = "oci")]
+pub use oci::{OciImportLimits, OciImportReport, OciRootfsLimits};
 pub use path::{PathComponent, PathComponentError, SymlinkTarget, SymlinkTargetError};
 
 #[cfg(feature = "native")]
