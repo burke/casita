@@ -193,6 +193,20 @@ and will use [Semantic Versioning](https://semver.org/) for tagged releases.
   `readahead_deferrals` and `buffer_bypasses`, report how often the budget runs
   out.
 
+### Fixed
+
+- An S3 repository no longer becomes unreadable after a commit raced a WAL
+  collection run by another handle. The collection appends a checkpoint of the
+  unchanged state, so the commit found its log position taken, saw the same
+  revision, and retried the record it had built on the old log: a delta then
+  named a checkpoint the collection deletes, or the committing handle recorded
+  its checkpoint at the position it first aimed at and broke the revision chain
+  with its next commit. Every commit was acknowledged, but a freshly opened
+  handle failed with `wal3 manifest has no record at position …` or
+  `wal3 delta revision chain is invalid`. A commit whose log moved under it is
+  now rebuilt on the log as it is, and caches the position where its record
+  actually lands.
+
 ### Security
 
 - Filesystem import and checkout resolve descendants beneath already-open root
