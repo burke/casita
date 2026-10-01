@@ -1,5 +1,24 @@
 # Benchmark suite
 
+## WAL3 commit preparation
+
+`benchmark run wal3-commit-preparation --iterations 100 --output /tmp/wal3-commit-preparation.json`
+compares the previous tail cloning and serializer with the current production
+preparation helpers in the same executable, alternating their order. Cases cover
+collection, 8 versus 9 deltas, and encoded records one byte below, exactly at,
+and one byte above the 1 MiB limit. Every iteration checks identical checkpoint
+selection and record bytes, and accepted tails must decode to the exact input.
+The prior tail contains object records, root changes, validation keys, and a
+payload catalog byte field. These are codec fixtures, not repository imports.
+
+Input construction and correctness checks are outside timing. The reported
+nanoseconds are totals across `iterations`, covering tail preparation, copies,
+and encoding, without WAL append, shard compaction, retry admission, or S3 I/O.
+Use an optimized test executable for performance comparisons. The suite runs in
+`benchmark all --suites wal3-commit-preparation --output /tmp/wal3-preparation-all`;
+`--bin-dir` may supply an existing `casita-lib-test` executable. Standalone runs
+accept `--probe-binary`. Both runners retain raw timings and correctness gates.
+
 ## Filesystem reuse
 
 `benchmark run filesystem-reuse` separates cached tree import from forced rereads
