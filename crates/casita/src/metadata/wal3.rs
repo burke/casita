@@ -34,6 +34,10 @@ use crate::object::{ObjectKey, ObjectRecord, RepositoryRevision, RootName, RootR
 #[path = "wal3/experiments.rs"]
 mod experiments;
 
+#[cfg(test)]
+#[path = "wal3/commit_benchmarks.rs"]
+mod commit_benchmarks;
+
 mod coordination;
 pub use coordination::Wal3RepositoryHold;
 
@@ -1125,14 +1129,13 @@ impl LoadedState {
         })
     }
 
-    /// Whether `other` was loaded from the same log records: the same next
-    /// write position, checkpoint and tail. A record built on one appends
-    /// validly after the other. Equal revisions do not imply this, because a
-    /// WAL collection appends a checkpoint of the current revision.
+    /// Whether `other` ends at the same append position and checkpoint.
+    /// Appends advance the log position even when the revision stays equal,
+    /// as with a WAL collection's checkpoint. The owned tail may have moved
+    /// into a planned append, so compare its immutable log positions instead.
     fn describes_same_log(&self, other: &Self) -> bool {
         self.next_write_position == other.next_write_position
             && self.base_position == other.base_position
-            && self.tail_deltas == other.tail_deltas
     }
 }
 
@@ -1580,7 +1583,7 @@ impl Wal3MetadataStore {
                 delta.revision = result.revision;
             }
             let mut plan = self
-                .plan_append(&view, next, delta, &mut checkpoint_lease)
+                .plan_append(&mut view, next, delta, &mut checkpoint_lease)
                 .await?;
             #[cfg(test)]
             if plan.delta_base.is_none()
@@ -1697,7 +1700,7 @@ impl Wal3MetadataStore {
                                 None => plan.state,
                             };
                             plan = self
-                                .plan_append(&view, next, delta, &mut checkpoint_lease)
+                                .plan_append(&mut view, next, delta, &mut checkpoint_lease)
                                 .await?;
                         }
                         let delay_ms = 1_u64 << attempt.min(6);
@@ -1807,25 +1810,16 @@ impl Wal3MetadataStore {
     /// for a collection, whose record is always a checkpoint.
     async fn plan_append(
         &self,
-        view: &LoadedState,
+        view: &mut LoadedState,
         next: StateData,
         delta: Option<StateDelta>,
         checkpoint_lease: &mut Option<super::wal3_shard::ShardBarrierLease>,
     ) -> Result<PlannedAppend, MetadataError> {
         // Collection is an exact replacement and must not retain or republish
         // pre-collection additions from the old cumulative tail.
-        let mut tail_deltas = if delta.is_some() {
-            view.tail_deltas.clone()
-        } else {
-            Vec::new()
-        };
-        tail_deltas.extend(delta);
         let base_position = view.base_position()?;
-        let delta_record = encode_delta_record(base_position, &tail_deltas);
-        let install_checkpoint = tail_deltas.len() > MAX_TAIL_DELTAS
-            || delta_record.len() > MAX_DELTA_RECORD_BYTES
-            || tail_deltas.is_empty();
-        if !install_checkpoint {
+        let tail_deltas = take_commit_tail(&mut view.tail_deltas, delta);
+        if let Some(delta_record) = encode_commit_delta(base_position, &tail_deltas) {
             return Ok(PlannedAppend {
                 record: delta_record,
                 state: next,
@@ -2642,6 +2636,27 @@ async fn flush_root_shard(
     Ok(())
 }
 
+/// Move the prior tail into an ordinary commit; collection starts a fresh tail.
+fn take_commit_tail(tail: &mut Vec<StateDelta>, delta: Option<StateDelta>) -> Vec<StateDelta> {
+    match delta {
+        Some(delta) => {
+            let mut tail = std::mem::take(tail);
+            tail.push(delta);
+            tail
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Only serialize tails that could be appended without a full checkpoint.
+fn encode_commit_delta(base_position: wal3::LogPosition, deltas: &[StateDelta]) -> Option<Vec<u8>> {
+    if deltas.is_empty() || deltas.len() > MAX_TAIL_DELTAS {
+        return None;
+    }
+    let record = encode_delta_record(base_position, deltas);
+    (record.len() <= MAX_DELTA_RECORD_BYTES).then_some(record)
+}
+
 fn encode_delta_record(base_position: wal3::LogPosition, deltas: &[StateDelta]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(DELTA_MAGIC_V1);
@@ -2838,8 +2853,7 @@ fn encode_state(state: &StateData) -> Result<Vec<u8>, MetadataError> {
     Ok(out)
 }
 
-fn put_entries(out: &mut Vec<u8>, entries: impl IntoIterator<Item = Vec<u8>>) {
-    let entries = entries.into_iter().collect::<Vec<_>>();
+fn put_entries(out: &mut Vec<u8>, entries: impl ExactSizeIterator<Item = Vec<u8>>) {
     out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
     for entry in entries {
         out.extend_from_slice(&(entry.len() as u64).to_le_bytes());

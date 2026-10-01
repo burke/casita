@@ -5027,10 +5027,10 @@ async fn composed_repository_takes_on_the_local_profile() {
 async fn collection_deletes_only_after_the_commits_that_allow_it_are_durable() {
     let temporary = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temporary.path().join("blobs")).unwrap();
+    // Loose collection unlinks immediately. Packed removal counts can instead
+    // describe catalog retirement while changed pins defer physical deletion.
     let repository = Repository::new(
-        crate::ChunkedBlobStore::local_packed(temporary.path().join("blobs"))
-            .await
-            .unwrap(),
+        crate::ChunkedBlobStore::local(temporary.path().join("blobs")).unwrap(),
         crate::TursoMetadataStore::open(temporary.path().join("casita.sqlite"))
             .await
             .unwrap(),
@@ -5039,6 +5039,7 @@ async fn collection_deletes_only_after_the_commits_that_allow_it_are_durable() {
     let name: RootName = "collected".parse().unwrap();
     let session = repository.mutation_session().await.unwrap();
     let object = session.stage_blob(&vec![7; 1 << 20]).await.unwrap();
+    let payload = object.record().payload();
     let key = object.record().key().clone();
     session
         .publish_rooted(vec![object], name.clone(), key)
@@ -5053,9 +5054,11 @@ async fn collection_deletes_only_after_the_commits_that_allow_it_are_durable() {
         .await
         .unwrap();
 
+    assert!(repository.payloads().has(&payload).await.unwrap());
     let before = commits.flushes();
     let outcome = repository.collect().await.unwrap();
     assert!(outcome.removed.payload_blobs > 0, "{outcome:?}");
+    assert!(!repository.payloads().has(&payload).await.unwrap());
     assert!(
         commits.flushes() > before,
         "collection deleted payloads without first flushing the commit that allowed it"

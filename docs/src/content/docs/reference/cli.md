@@ -75,7 +75,7 @@ casita [--repository PATH] import [-i IMPORTER] PATH [--root NAME] \
 
 Without `-i`, Casita recognizes Git repositories from their metadata,
 probes regular-file headers for Casitar or tar, and otherwise imports a
-directory as a filesystem tree. Use `-i filesystem|tar|git|casitar` to select
+directory as a filesystem tree. Use `-i filesystem|tar|git|casitar|oci` to select
 an importer explicitly. Standard input (`-`) requires `-i`.
 
 For a filesystem import, `--root` names the tree. When omitted, Casita derives
@@ -84,15 +84,38 @@ explicit and automatic names are scoped by its UUID. Importing the workspace
 directory omits its `.casita` marker.
 `--retention` publishes the root and policy together for filesystem and tar
 imports. Roots are permanent by default; omitting the flag keeps an existing
-root's policy. Git and Casitar imports do not accept this flag.
+root's policy. Git, Casitar, and OCI imports do not accept this flag.
 
-The importer prints the directory key and does not follow symlinks. It may
-reuse a file whose device, inode, size, and timestamps match the previous
-import. `--filesystem-rehash` reads every file again. Use
+The filesystem importer prints the directory key and does not follow
+symlinks. It may reuse a file whose device, inode, size, and timestamps match
+the previous import. `--filesystem-rehash` reads every file again. Use
 `--filesystem-concurrency FILES` to change the number of files ingested at
 once (default 16), and `--chunk-upload-concurrency CHUNKS` to bound uploads
 per blob writer (default 32). See [Import semantics](../../concepts/imports/)
 for the reuse assumption.
+
+### `import -i oci`
+
+```text
+casita [--repository PATH] import -i oci IMAGE --root NAME \
+  [--oci-platform OS/ARCH[/VARIANT]] [--oci-http] \
+  [--oci-max-blob-bytes BYTES] [--oci-max-total-blob-bytes BYTES] \
+  [--oci-rootfs-root NAME] [--oci-rootfs-max-bytes BYTES] \
+  [--oci-rootfs-max-entries COUNT]
+```
+
+Requires the `oci` Cargo feature. The importer selects one platform's manifest
+and downloads its config and compressed layer blobs into a standard OCI image
+layout. Layer blobs stream into storage. It uses anonymous registry access
+and HTTPS by default.
+
+`--root` names the OCI image layout, including its original layer archives.
+`--oci-rootfs-root` optionally names the merged container root filesystem,
+which can be checked out or mounted. The names must differ. Casita applies
+layer whiteouts and verifies uncompressed DiffIDs before publishing both
+roots atomically. The filesystem bounds limit decoded tar bytes and entries;
+the blob bounds limit the original compressed downloads.
+See [Import an OCI Image](../../guides/oci/) for the output and limits.
 
 ### `import -i tar`
 

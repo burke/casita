@@ -399,6 +399,8 @@ pub(super) enum NativeGitCommand {
 pub(super) enum ImporterKind {
     Filesystem,
     Tar,
+    #[cfg(feature = "oci")]
+    Oci,
     Git,
     Casitar,
 }
@@ -411,8 +413,9 @@ pub(super) struct ImportArgs {
     /// Importer to run. When omitted, Casita detects the input type.
     #[arg(short = 'i', long, value_enum)]
     pub(super) importer: Option<ImporterKind>,
-    /// Workspace-local name to register the root under. Defaults to the
-    /// canonicalized source path below `auto/`.
+    /// Root name for filesystem, tar, or OCI imports. For OCI, names the image
+    /// layout. Filesystem imports default to the canonicalized source path
+    /// below `auto/`.
     #[arg(long = "root")]
     pub(super) name: Option<String>,
     /// Retention policy for the imported root. Existing policy is kept when omitted.
@@ -433,10 +436,56 @@ pub(super) struct ImportArgs {
     pub(super) chunk_upload_concurrency: std::num::NonZeroUsize,
     #[command(flatten)]
     pub(super) tar: TarImportArgs,
+    #[cfg(feature = "oci")]
+    #[command(flatten)]
+    pub(super) oci: OciImportArgs,
     #[command(flatten)]
     pub(super) git: GitImportArgs,
     #[command(flatten)]
     pub(super) casitar: CasitarImportArgs,
+}
+
+#[cfg(feature = "oci")]
+#[derive(Args)]
+pub(super) struct OciImportArgs {
+    /// Also publish the merged container root filesystem under this name.
+    /// Must differ from --root, which names the OCI image layout.
+    #[arg(long = "oci-rootfs-root", value_name = "NAME")]
+    pub(super) rootfs_root: Option<String>,
+    /// Maximum decoded tar bytes across all layers of a merged filesystem.
+    #[arg(long = "oci-rootfs-max-bytes", default_value_t = casita::OciRootfsLimits::default().max_total_archive_bytes)]
+    pub(super) rootfs_max_bytes: u64,
+    /// Maximum layer entries and merged filesystem nodes.
+    #[arg(long = "oci-rootfs-max-entries", default_value_t = casita::OciRootfsLimits::default().max_entries)]
+    pub(super) rootfs_max_entries: usize,
+    /// Select a platform from an image index, for example linux/amd64.
+    #[arg(long = "oci-platform", value_name = "OS/ARCH[/VARIANT]")]
+    pub(super) platform: Option<String>,
+    /// Use plain HTTP for a registry. Intended for explicitly trusted local registries.
+    #[arg(long = "oci-http")]
+    pub(super) http: bool,
+    /// Maximum compressed bytes in one config or layer blob.
+    #[arg(long = "oci-max-blob-bytes", default_value_t = casita::OciImportLimits::default().max_blob_bytes)]
+    pub(super) max_blob_bytes: u64,
+    /// Maximum aggregate compressed config and layer bytes.
+    #[arg(long = "oci-max-total-blob-bytes", default_value_t = casita::OciImportLimits::default().max_total_blob_bytes)]
+    pub(super) max_total_blob_bytes: u64,
+}
+
+#[cfg(feature = "oci")]
+impl Default for OciImportArgs {
+    fn default() -> Self {
+        let limits = casita::OciImportLimits::default();
+        Self {
+            rootfs_root: None,
+            rootfs_max_bytes: casita::OciRootfsLimits::default().max_total_archive_bytes,
+            rootfs_max_entries: casita::OciRootfsLimits::default().max_entries,
+            platform: None,
+            http: false,
+            max_blob_bytes: limits.max_blob_bytes,
+            max_total_blob_bytes: limits.max_total_blob_bytes,
+        }
+    }
 }
 
 #[derive(Args)]

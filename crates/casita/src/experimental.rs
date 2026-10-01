@@ -153,6 +153,8 @@ pub use crate::metadata::{
 };
 #[cfg(feature = "s3")]
 pub use crate::metadata::{Wal3MetadataStore, Wal3ReadStats, Wal3RepositoryHold};
+#[cfg(feature = "oci")]
+pub use crate::oci::{OciImportError, OciImportLimits, OciImportReport, OciRootfsLimits};
 pub use crate::path::{PathComponent, PathComponentError, SymlinkTarget, SymlinkTargetError};
 #[cfg(feature = "native")]
 pub use crate::repository::{
