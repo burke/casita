@@ -34,6 +34,10 @@ use crate::object::{ObjectKey, ObjectRecord, RepositoryRevision, RootName, RootR
 #[path = "wal3/experiments.rs"]
 mod experiments;
 
+#[cfg(test)]
+#[path = "wal3/commit_benchmarks.rs"]
+mod commit_benchmarks;
+
 mod coordination;
 pub use coordination::Wal3RepositoryHold;
 
@@ -1610,23 +1614,16 @@ impl Wal3MetadataStore {
         }
         // Collection is an exact replacement and must not retain or republish
         // pre-collection additions from the old cumulative tail.
-        let mut tail_deltas = if collection {
-            Vec::new()
-        } else {
-            loaded.tail_deltas.clone()
-        };
-        if let Some(delta) = delta {
-            tail_deltas.push(delta);
-        }
+        let tail_deltas = take_commit_tail(&mut loaded.tail_deltas, delta);
         let base_position = loaded.base_position()?;
-        let delta_record = encode_delta_record(base_position, &tail_deltas);
-        let install_checkpoint = tail_deltas.len() > MAX_TAIL_DELTAS
-            || delta_record.len() > MAX_DELTA_RECORD_BYTES
-            || tail_deltas.is_empty();
+        let delta_record = encode_commit_delta(base_position, &tail_deltas);
+        let install_checkpoint = delta_record.is_none();
         if install_checkpoint && checkpoint_lease.is_none() {
             checkpoint_lease = Some(self.object_shards.acquire_checkpoint_barrier().await?);
         }
-        let record = if install_checkpoint {
+        let record = if let Some(record) = delta_record {
+            record
+        } else {
             next = match compact_state_objects(&self.object_shards, &next).await {
                 Ok(next) => next,
                 Err(error) => {
@@ -1645,8 +1642,6 @@ impl Wal3MetadataStore {
                     return Err(error);
                 }
             }
-        } else {
-            delta_record
         };
         #[cfg(test)]
         if install_checkpoint && let Some(pause) = &self.checkpoint_pause {
@@ -2576,6 +2571,27 @@ async fn flush_root_shard(
     Ok(())
 }
 
+/// Move the prior tail into an ordinary commit; collection starts a fresh tail.
+fn take_commit_tail(tail: &mut Vec<StateDelta>, delta: Option<StateDelta>) -> Vec<StateDelta> {
+    match delta {
+        Some(delta) => {
+            let mut tail = std::mem::take(tail);
+            tail.push(delta);
+            tail
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Only serialize tails that could be appended without a full checkpoint.
+fn encode_commit_delta(base_position: wal3::LogPosition, deltas: &[StateDelta]) -> Option<Vec<u8>> {
+    if deltas.is_empty() || deltas.len() > MAX_TAIL_DELTAS {
+        return None;
+    }
+    let record = encode_delta_record(base_position, deltas);
+    (record.len() <= MAX_DELTA_RECORD_BYTES).then_some(record)
+}
+
 fn encode_delta_record(base_position: wal3::LogPosition, deltas: &[StateDelta]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(DELTA_MAGIC_V1);
@@ -2772,8 +2788,7 @@ fn encode_state(state: &StateData) -> Result<Vec<u8>, MetadataError> {
     Ok(out)
 }
 
-fn put_entries(out: &mut Vec<u8>, entries: impl IntoIterator<Item = Vec<u8>>) {
-    let entries = entries.into_iter().collect::<Vec<_>>();
+fn put_entries(out: &mut Vec<u8>, entries: impl ExactSizeIterator<Item = Vec<u8>>) {
     out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
     for entry in entries {
         out.extend_from_slice(&(entry.len() as u64).to_le_bytes());

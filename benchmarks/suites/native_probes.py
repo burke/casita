@@ -16,6 +16,7 @@ PROBES = {
     "catalog-maintenance": "blob::pack::benchmarks::benchmark_catalog_reclaim_marker_probe",
     "catalog-durability": "blob::pack::benchmarks::benchmark_local_catalog_durable_publication",
     "logical-state": "metadata::wal3_shard::tests::benchmark_logical_state_shards_scale",
+    "wal3-commit-preparation": "metadata::wal3::commit_benchmarks::benchmark_commit_preparation",
 }
 
 # Probes outside the default suites of their name prefix.
